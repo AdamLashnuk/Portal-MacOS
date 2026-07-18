@@ -1,4 +1,4 @@
-# Portal
+# Portal-MacOS
 
 > Pre-Release Notice: Portal is currently in active development and should be considered a pre-release version. Features may change, bugs may be present, and certain functionality may be incomplete as development continues. Feedback, bug reports, and suggestions are welcome.
 
