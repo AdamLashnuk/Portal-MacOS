@@ -1,3 +1,5 @@
 PySide6
 PySide6-WebEngine
 keyboard
+pynput
+pyobjc-framework-Quartz; sys_platform == "darwin"

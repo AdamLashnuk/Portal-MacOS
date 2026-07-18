@@ -1,7 +1,7 @@
 import os
 import json
 import uuid
-import keyboard
+from app.hotkeys.manager import HotkeyManager
 import re
 from PySide6.QtWidgets import (QFileDialog, QWidget, QPushButton, QVBoxLayout, QHBoxLayout, QLabel,
                                QFrame, QRubberBand, QGraphicsOpacityEffect, QSizePolicy,
@@ -154,6 +154,9 @@ class ChatPanel(QWidget):
         self.setting_panel.color_changed.connect(self.update_content_area_color)
         self.setting_panel.clear_data_requested.connect(self.clear_browsing_data)
 
+        self.hotkey_manager = HotkeyManager(self)
+        self._mac_permission_prompted = False
+
         self.setting_panel.keybinds_updated.connect(self.apply_keybinds)
         self.apply_keybinds(self.setting_panel.current_keybinds)
 
@@ -182,34 +185,48 @@ class ChatPanel(QWidget):
         self.content_stack.setCurrentWidget(previous_widget)
 
     def apply_keybinds(self, keybinds_dict):
-        try:
-            keyboard.unhook_all()
-        except:
-            pass
+        self.hotkey_manager.unhook_all()
 
         for sc in self.local_shortcuts:
             sc.setParent(None)
             sc.deleteLater()
         self.local_shortcuts.clear()
 
+        permission_blocked = False
+
         for action_id, data in keybinds_dict.items():
             key_str = data["key"]
             is_global = data["is_global"]
-
-            if not key_str: continue
+            if not key_str:
+                continue
 
             if is_global:
-                kb_str = key_str.lower().replace("meta", "windows").replace("return", "enter").replace("del",
-                                                                                                       "delete").replace(
-                    "ins", "insert")
-                try:
-                    keyboard.add_hotkey(kb_str, lambda a=action_id: self.hotkey_bridge.trigger.emit(a))
-                except Exception as e:
-                    print(f"Failed to bind global hotkey {kb_str}: {e}")
+                status = self.hotkey_manager.permission_status()
+                if status == "denied":
+                    permission_blocked = True
+                    continue
+                ok = self.hotkey_manager.register(
+                    key_str, lambda a=action_id: self.hotkey_bridge.trigger.emit(a)
+                )
+                if not ok:
+                    print(f"Failed to bind global hotkey for {action_id}: {key_str}")
             else:
                 sc = QShortcut(QKeySequence(key_str), self)
                 sc.activated.connect(lambda a=action_id: self.execute_hotkey_action(a))
                 self.local_shortcuts.append(sc)
+
+        if permission_blocked:
+            self.prompt_for_mac_accessibility_permission()
+
+    def prompt_for_mac_accessibility_permission(self):
+        if self._mac_permission_prompted:
+            return
+        self._mac_permission_prompted = True
+        self.hotkey_manager.request_permission()
+        # NOTE: after granting, macOS requires the app to be relaunched before
+        # the permission takes effect — it won't apply to the already-running
+        # process. Worth a small in-app banner here telling the user that;
+        # I left it as a TODO rather than guessing at your UI style.
 
     def execute_hotkey_action(self, action_id):
         if action_id == "summon":
@@ -319,6 +336,7 @@ class ChatPanel(QWidget):
         )
 
         self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_MacAlwaysShowToolWindow, True)
         self.setMouseTracking(True)
 
         self.setStyleSheet("""

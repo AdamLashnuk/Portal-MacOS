@@ -65,7 +65,8 @@ class FloatingWidget(QWidget):
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_Hover)
         self.setAttribute(Qt.WA_TranslucentBackground)
-
+        self.setAttribute(Qt.WA_MacAlwaysShowToolWindow, True)
+        
         self.settings = QSettings("MyLLMWidget", "Portal")
 
         logo_path = get_asset_path(os.path.join("assets", "portalbig.png"))

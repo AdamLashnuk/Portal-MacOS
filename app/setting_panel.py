@@ -9,14 +9,27 @@ from PySide6.QtGui import QPixmap, QColor, QImage, QKeySequence, QPainter, QBrus
 
 from app.utils import get_asset_path
 
-DEFAULT_KEYBINDS = {
+import sys
+
+_WINDOWS_DEFAULT_KEYBINDS = {
     "summon": {"label": "Summon Panel", "key": "Ctrl+Space", "is_global": True},
     "hide": {"label": "Hide Panel", "key": "Esc", "is_global": False},
     "next_llm": {"label": "Next LLM", "key": "Ctrl+Tab", "is_global": False},
     "refresh": {"label": "Hard Refresh", "key": "F5", "is_global": False},
     "quick_refresh": {"label": "Quick Refresh", "key": "Ctrl+R", "is_global": False},
-    "pin_toggle": {"label": "Toggle Pin", "key": "Alt+P", "is_global": True}
+    "pin_toggle": {"label": "Toggle Pin", "key": "Alt+P", "is_global": True},
 }
+
+_MAC_DEFAULT_KEYBINDS = {
+    "summon": {"label": "Summon Panel", "key": "Cmd+Shift+Space", "is_global": True},   # Cmd+Space is Spotlight
+    "hide": {"label": "Hide Panel", "key": "Esc", "is_global": False},
+    "next_llm": {"label": "Next LLM", "key": "Cmd+Shift+]", "is_global": False},        # Cmd+Tab is unusable (OS-reserved)
+    "refresh": {"label": "Hard Refresh", "key": "Cmd+Shift+R", "is_global": False},
+    "quick_refresh": {"label": "Quick Refresh", "key": "Cmd+R", "is_global": False},
+    "pin_toggle": {"label": "Toggle Pin", "key": "Cmd+Option+P", "is_global": True},
+}
+
+DEFAULT_KEYBINDS = _MAC_DEFAULT_KEYBINDS if sys.platform == "darwin" else _WINDOWS_DEFAULT_KEYBINDS
 
 
 class CustomSlider(QWidget):
