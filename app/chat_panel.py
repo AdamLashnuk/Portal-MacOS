@@ -36,7 +36,10 @@ class AddLLMDialog(QDialog):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowFlags(Qt.Popup | Qt.FramelessWindowHint)
+        self.setWindowFlags(
+            Qt.FramelessWindowHint |
+            Qt.Tool
+        )
         self.setFixedSize(200, 250)
         self.setStyleSheet("""
             QDialog {
@@ -79,7 +82,7 @@ class AddLLMDialog(QDialog):
         self.search_bar.setPlaceholderText("Search LLMs...")
         self.search_bar.textChanged.connect(self.filter_list)
         layout.addWidget(self.search_bar)
-
+        self.add_llm_dialog = None
         self.list_widget = QListWidget()
         self.list_widget.itemClicked.connect(self.on_item_clicked)
         layout.addWidget(self.list_widget)
@@ -159,6 +162,7 @@ class ChatPanel(QWidget):
 
         self.setting_panel.keybinds_updated.connect(self.apply_keybinds)
         self.apply_keybinds(self.setting_panel.current_keybinds)
+        self.add_llm_dialog = None
 
         self.create_layout()
         self.apply_real_minimum_size()
@@ -330,9 +334,8 @@ class ChatPanel(QWidget):
             self.resize(900, 700)
 
         self.setWindowFlags(
-            Qt.FramelessWindowHint |
-            Qt.WindowStaysOnTopHint |
-            Qt.Tool
+            Qt.Popup |
+            Qt.FramelessWindowHint
         )
 
         self.setAttribute(Qt.WA_TranslucentBackground)
@@ -988,12 +991,36 @@ class ChatPanel(QWidget):
         pop_anim.start()
 
     def open_add_llm_menu(self):
+        if self.add_llm_dialog is not None:
+            self.add_llm_dialog.close()
+            self.add_llm_dialog = None
+            return
+
         dialog = AddLLMDialog(self)
+        self.add_llm_dialog = dialog
+
         dialog.llm_selected.connect(self.add_llm_to_bar)
 
-        button_pos = self.add_button.mapToGlobal(QPoint(0, self.add_button.height()))
-        dialog.move(button_pos.x() - (dialog.width() // 2), button_pos.y() + 5)
-        dialog.exec()
+        button_pos = self.add_button.mapToGlobal(
+            QPoint(0, self.add_button.height())
+        )
+
+        dialog.move(
+            button_pos.x() - (dialog.width() // 2),
+            button_pos.y() + 5
+        )
+
+        def clear_dialog_reference():
+            if self.add_llm_dialog is dialog:
+                self.add_llm_dialog = None
+
+        dialog.finished.connect(clear_dialog_reference)
+        dialog.destroyed.connect(clear_dialog_reference)
+
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        dialog.search_bar.setFocus()
 
     def add_llm_to_bar(self, name, url):
         unique_name = self._unique_llm_name(name)

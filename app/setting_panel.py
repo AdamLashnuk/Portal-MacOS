@@ -11,6 +11,7 @@ from app.utils import get_asset_path
 
 import sys
 
+print("Platform:", sys.platform)
 _WINDOWS_DEFAULT_KEYBINDS = {
     "summon": {"label": "Summon Panel", "key": "Ctrl+Space", "is_global": True},
     "hide": {"label": "Hide Panel", "key": "Esc", "is_global": False},
@@ -21,12 +22,36 @@ _WINDOWS_DEFAULT_KEYBINDS = {
 }
 
 _MAC_DEFAULT_KEYBINDS = {
-    "summon": {"label": "Summon Panel", "key": "Cmd+Shift+Space", "is_global": True},   # Cmd+Space is Spotlight
-    "hide": {"label": "Hide Panel", "key": "Esc", "is_global": False},
-    "next_llm": {"label": "Next LLM", "key": "Cmd+Shift+]", "is_global": False},        # Cmd+Tab is unusable (OS-reserved)
-    "refresh": {"label": "Hard Refresh", "key": "Cmd+Shift+R", "is_global": False},
-    "quick_refresh": {"label": "Quick Refresh", "key": "Cmd+R", "is_global": False},
-    "pin_toggle": {"label": "Toggle Pin", "key": "Cmd+Option+P", "is_global": True},
+    "summon": {
+        "label": "Summon Panel",
+        "key": "Meta+Shift+Space",
+        "is_global": True
+    },
+    "hide": {
+        "label": "Hide Panel",
+        "key": "Esc",
+        "is_global": False
+    },
+    "next_llm": {
+        "label": "Next LLM",
+        "key": "Meta+Shift+]",
+        "is_global": False
+    },
+    "refresh": {
+        "label": "Hard Refresh",
+        "key": "Meta+Shift+R",
+        "is_global": False
+    },
+    "quick_refresh": {
+        "label": "Quick Refresh",
+        "key": "Meta+R",
+        "is_global": False
+    },
+    "pin_toggle": {
+        "label": "Toggle Pin",
+        "key": "Meta+Alt+P",
+        "is_global": True
+    },
 }
 
 DEFAULT_KEYBINDS = _MAC_DEFAULT_KEYBINDS if sys.platform == "darwin" else _WINDOWS_DEFAULT_KEYBINDS
