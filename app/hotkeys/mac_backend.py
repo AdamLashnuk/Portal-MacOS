@@ -1,11 +1,9 @@
 """
 macOS global hotkeys via pynput, gated behind Apple's Input Monitoring
-permission. Unlike Windows, a process cannot listen to system-wide
-keystrokes here without the user explicitly flipping a switch in
-System Settings > Privacy & Security > Accessibility (sometimes shown
-as "Input Monitoring" depending on macOS version).
+permission.
 """
 
+import threading
 from app.hotkeys.backend_base import HotkeyBackend
 
 try:
@@ -19,11 +17,9 @@ except ImportError:
     Quartz = None
 
 
-# Qt's QKeySequence spells keys differently than pynput expects.
-# This translates the tokens we actually use in DEFAULT_KEYBINDS.
 _KEY_ALIASES = {
     "ctrl": "ctrl", "control": "ctrl",
-    "cmd": "cmd", "meta": "cmd", "command": "cmd",  # Qt's "Meta" == the Cmd key on macOS
+    "cmd": "cmd", "meta": "cmd", "command": "cmd",
     "alt": "alt", "option": "alt",
     "shift": "shift",
     "space": "space",
@@ -37,7 +33,6 @@ _KEY_ALIASES = {
 
 
 def _to_pynput_combo(key_str):
-    """'Cmd+Shift+Space' -> '<cmd>+<shift>+<space>'. Returns None if unmappable."""
     tokens = []
     for part in (p.strip() for p in key_str.split("+") if p.strip()):
         lower = part.lower()
@@ -45,9 +40,9 @@ def _to_pynput_combo(key_str):
         if mapped:
             tokens.append(f"<{mapped}>")
         elif len(lower) == 1:
-            tokens.append(lower)  # bare printable char, e.g. "p"
+            tokens.append(lower)
         elif lower.startswith("f") and lower[1:].isdigit():
-            tokens.append(f"<{lower}>")  # F1-F12
+            tokens.append(f"<{lower}>")
         else:
             return None
     return "+".join(tokens) if tokens else None
@@ -55,8 +50,39 @@ def _to_pynput_combo(key_str):
 
 class MacHotkeyBackend(HotkeyBackend):
     def __init__(self):
+        self._lock = threading.Lock()
+        self._hotkeys = {}  # combo string -> pynput.keyboard.HotKey
         self._listener = None
-        self._bindings = {}
+
+        if pynput_keyboard is not None:
+            # Start the ONE listener for the whole app lifetime. We never
+            # stop/restart this — that repeated stop/start was what caused
+            # the crash. Adding/changing/removing hotkeys later only edits
+            # self._hotkeys, guarded by the lock; the native macOS hook
+            # itself is never touched again after this line.
+            self._listener = pynput_keyboard.Listener(
+                on_press=self._on_press,
+                on_release=self._on_release,
+            )
+            self._listener.start()
+
+    def _on_press(self, key):
+        with self._lock:
+            hotkeys = list(self._hotkeys.values())
+        for hk in hotkeys:
+            try:
+                hk.press(self._listener.canonical(key))
+            except Exception:
+                pass
+
+    def _on_release(self, key):
+        with self._lock:
+            hotkeys = list(self._hotkeys.values())
+        for hk in hotkeys:
+            try:
+                hk.release(self._listener.canonical(key))
+            except Exception:
+                pass
 
     def permission_status(self):
         if Quartz is None:
@@ -67,11 +93,6 @@ class MacHotkeyBackend(HotkeyBackend):
             return "unsupported"
 
     def request_permission(self):
-        """
-        Shows the native "Portal.app would like to control this computer"
-        dialog. macOS only shows this once per install automatically —
-        after a denial, the user must enable it manually in System Settings.
-        """
         if Quartz is None:
             return
         try:
@@ -80,13 +101,8 @@ class MacHotkeyBackend(HotkeyBackend):
             pass
 
     def unhook_all(self):
-        if self._listener is not None:
-            try:
-                self._listener.stop()
-            except Exception:
-                pass
-            self._listener = None
-        self._bindings.clear()
+        with self._lock:
+            self._hotkeys.clear()
 
     def register(self, key_str, callback):
         if pynput_keyboard is None:
@@ -96,23 +112,13 @@ class MacHotkeyBackend(HotkeyBackend):
         if combo is None:
             print(f"Could not map hotkey '{key_str}' to a macOS shortcut.")
             return False
-        self._bindings[combo] = callback
-        self._restart_listener()
-        return True
+        try:
+            keys = pynput_keyboard.HotKey.parse(combo)
+        except Exception as e:
+            print(f"Could not parse hotkey '{key_str}': {e}")
+            return False
 
-    def _restart_listener(self):
-        if self._listener is not None:
-            try:
-                self._listener.stop()
-            except Exception:
-                pass
-        if not self._bindings:
-            self._listener = None
-            return
-        # pynput's GlobalHotKeys runs its own background thread and fires
-        # callbacks from that thread, not Qt's main thread. That's fine here
-        # because the callback we pass in emits a Qt Signal — Qt automatically
-        # queues signal emissions from a non-GUI thread onto the GUI thread,
-        # so no extra thread-safety code is needed on our end.
-        self._listener = pynput_keyboard.GlobalHotKeys(dict(self._bindings))
-        self._listener.start()
+        hotkey = pynput_keyboard.HotKey(keys, callback)
+        with self._lock:
+            self._hotkeys[combo] = hotkey
+        return True

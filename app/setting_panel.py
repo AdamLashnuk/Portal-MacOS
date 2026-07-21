@@ -3,8 +3,9 @@ import json
 import copy
 import sys as sys_module
 from PySide6.QtWidgets import (QComboBox, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame, QStackedWidget,
-                               QButtonGroup, QKeySequenceEdit, QSlider, QLayout, QSizePolicy)
-from PySide6.QtCore import Qt, Signal, QSettings, QRect, QSize, QPoint
+                               QButtonGroup, QKeySequenceEdit, QSlider, QLayout, QSizePolicy, QLineEdit)
+                               
+from PySide6.QtCore import Qt, Signal, QSettings, QRect, QSize, QPoint, QTimer
 from PySide6.QtGui import QPixmap, QColor, QImage, QKeySequence, QPainter, QBrush
 
 from app.utils import get_asset_path
@@ -55,6 +56,55 @@ _MAC_DEFAULT_KEYBINDS = {
 }
 
 DEFAULT_KEYBINDS = _MAC_DEFAULT_KEYBINDS if sys.platform == "darwin" else _WINDOWS_DEFAULT_KEYBINDS
+
+class KeyCaptureEdit(QLineEdit):
+    """
+    Drop-in replacement for QKeySequenceEdit. QKeySequenceEdit calls
+    grabKeyboard() while recording, which appears to silently fail on
+    macOS because this app's main window uses the Qt.Popup flag —
+    popups already do their own keyboard/focus handling, and layering
+    another OS-level keyboard grab on top of that doesn't work reliably.
+    This widget captures keys the normal way (just overriding
+    keyPressEvent), no OS-level grab involved.
+    """
+    keySequenceChanged = Signal(QKeySequence)
+
+    def __init__(self, initial_sequence=None, parent=None):
+        super().__init__(parent)
+        self.setReadOnly(True)
+        self._sequence = QKeySequence(initial_sequence) if initial_sequence else QKeySequence()
+        self.setText(self._sequence.toString())
+        self.setPlaceholderText("Press a key combo...")
+
+    def keyPressEvent(self, event):
+        key = event.key()
+        if key in (Qt.Key_Control, Qt.Key_Shift, Qt.Key_Alt, Qt.Key_Meta):
+            return
+
+        modifiers = event.modifiers()
+        combo = 0
+        if modifiers & Qt.ControlModifier:
+            combo |= Qt.CTRL
+        if modifiers & Qt.ShiftModifier:
+            combo |= Qt.SHIFT
+        if modifiers & Qt.AltModifier:
+            combo |= Qt.ALT
+        if modifiers & Qt.MetaModifier:
+            combo |= Qt.META
+        combo |= key
+
+        seq = QKeySequence(combo)
+        self._sequence = seq
+        self.setText(seq.toString())
+        self.keySequenceChanged.emit(seq)
+        event.accept()
+
+    def keySequence(self):
+        return self._sequence
+
+    def setKeySequence(self, seq):
+        self._sequence = QKeySequence(seq)
+        self.setText(self._sequence.toString())
 
 
 class CustomSlider(QWidget):
@@ -254,6 +304,10 @@ class SettingPanel(QWidget):
     def update_keybind_seq(self, action_id, seq_str):
         self.current_keybinds[action_id]["key"] = seq_str
         self.save_all_keybinds()
+
+    def _on_scope_toggled(self, toggle_btn, action_id, checked):
+        toggle_btn.setText("Global" if checked else "Local")
+        QTimer.singleShot(0, lambda: self.update_keybind_scope(action_id, checked))
 
     def update_keybind_scope(self, action_id, is_global):
         self.current_keybinds[action_id]["is_global"] = is_global
@@ -693,11 +747,10 @@ class SettingPanel(QWidget):
             toggle.setCursor(Qt.PointingHandCursor)
             toggle.setFixedWidth(65)
 
-            key_edit = QKeySequenceEdit(QKeySequence(data["key"]))
+            key_edit = KeyCaptureEdit(data["key"])
             key_edit.setFixedWidth(180)
 
-            toggle.toggled.connect(lambda checked, t=toggle, a=action_id: [t.setText("Global" if checked else "Local"),
-                                                                           self.update_keybind_scope(a, checked)])
+            toggle.toggled.connect(lambda checked, t=toggle, a=action_id: self._on_scope_toggled(t, a, checked))
             key_edit.keySequenceChanged.connect(lambda seq, a=action_id: self.update_keybind_seq(a, seq.toString()))
 
             row_layout.addWidget(toggle)

@@ -219,6 +219,8 @@ class ChatPanel(QWidget):
                 sc.activated.connect(lambda a=action_id: self.execute_hotkey_action(a))
                 self.local_shortcuts.append(sc)
 
+            self.hotkey_manager.commit()
+
         if permission_blocked:
             self.prompt_for_mac_accessibility_permission()
 

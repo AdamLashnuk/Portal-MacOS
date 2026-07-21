@@ -23,5 +23,8 @@ class HotkeyManager(QObject):
     def unhook_all(self):
         self.backend.unhook_all()
 
+    def commit(self):
+        self.backend.commit()
+
     def register(self, key_str, callback):
         return self.backend.register(key_str, callback)
