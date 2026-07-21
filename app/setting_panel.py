@@ -3,9 +3,8 @@ import json
 import copy
 import sys as sys_module
 from PySide6.QtWidgets import (QComboBox, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame, QStackedWidget,
-                               QButtonGroup, QKeySequenceEdit, QSlider, QLayout, QSizePolicy, QLineEdit)
-                               
-from PySide6.QtCore import Qt, Signal, QSettings, QRect, QSize, QPoint, QTimer
+                               QButtonGroup, QKeySequenceEdit, QSlider, QLayout, QSizePolicy, QLineEdit, QApplication)
+from PySide6.QtCore import Qt, Signal, QSettings, QRect, QSize, QPoint, QTimer, QEvent
 from PySide6.QtGui import QPixmap, QColor, QImage, QKeySequence, QPainter, QBrush
 
 from app.utils import get_asset_path
@@ -64,8 +63,14 @@ class KeyCaptureEdit(QLineEdit):
     macOS because this app's main window uses the Qt.Popup flag —
     popups already do their own keyboard/focus handling, and layering
     another OS-level keyboard grab on top of that doesn't work reliably.
-    This widget captures keys the normal way (just overriding
-    keyPressEvent), no OS-level grab involved.
+
+    Because of that same Qt.Popup behavior, this widget's own
+    keyPressEvent isn't reliably delivered on macOS either. So instead
+    of depending on keyPressEvent, this widget installs an app-wide
+    event filter (on its top-level window, which implements
+    eventFilter) only while it's actively "capturing" a new shortcut,
+    and removes it immediately after. Keeping it installed at all times
+    was causing a native-level crash when opening the popup panel.
     """
     keySequenceChanged = Signal(QKeySequence)
 
@@ -73,10 +78,24 @@ class KeyCaptureEdit(QLineEdit):
         super().__init__(parent)
         self.setReadOnly(True)
         self._sequence = QKeySequence(initial_sequence) if initial_sequence else QKeySequence()
-        self.setText(self._sequence.toString())
+        self.setText(self._sequence.toString(QKeySequence.NativeText))
         self.setPlaceholderText("Press a key combo...")
+        self.capturing = False
 
-    def keyPressEvent(self, event):
+    def mousePressEvent(self, event):
+        self.capturing = True
+        self.setText("")
+        super().mousePressEvent(event)
+        self.setFocus(Qt.MouseFocusReason)
+        QApplication.instance().installEventFilter(self.window())
+
+    def focusOutEvent(self, event):
+        self.capturing = False
+        self.setText(self._sequence.toString(QKeySequence.NativeText))
+        QApplication.instance().removeEventFilter(self.window())
+        super().focusOutEvent(event)
+
+    def process_key_event(self, event):
         key = event.key()
         if key in (Qt.Key_Control, Qt.Key_Shift, Qt.Key_Alt, Qt.Key_Meta):
             return
@@ -95,8 +114,13 @@ class KeyCaptureEdit(QLineEdit):
 
         seq = QKeySequence(combo)
         self._sequence = seq
-        self.setText(seq.toString())
+        self.capturing = False
+        self.setText(seq.toString(QKeySequence.NativeText))
+        QApplication.instance().removeEventFilter(self.window())
         self.keySequenceChanged.emit(seq)
+
+    def keyPressEvent(self, event):
+        self.process_key_event(event)
         event.accept()
 
     def keySequence(self):
@@ -104,8 +128,8 @@ class KeyCaptureEdit(QLineEdit):
 
     def setKeySequence(self, seq):
         self._sequence = QKeySequence(seq)
-        self.setText(self._sequence.toString())
-
+        self.capturing = False
+        self.setText(self._sequence.toString(QKeySequence.NativeText))
 
 class CustomSlider(QWidget):
     valueChanged = Signal(int)
@@ -250,7 +274,16 @@ class SettingPanel(QWidget):
         self.settings.setValue("shortcuts", json.dumps(self.current_keybinds))
         self.settings.sync()
         self.keybinds_updated.emit(self.current_keybinds)
-
+    
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.KeyPress and getattr(self, "keybind_widgets", None):
+            for widgets in self.keybind_widgets.values():
+                edit = widgets.get("edit")
+                if edit is not None and getattr(edit, "capturing", False):
+                    edit.process_key_event(event)
+                    return True
+        return super().eventFilter(obj, event)
+    
     def _migrate_legacy_color(self, legacy_value):
         """
         Pulls a base RGB + opacity percentage out of an old-style saved
@@ -384,7 +417,7 @@ class SettingPanel(QWidget):
         self.nav_group.addButton(self.appearance_btn, 0)
         sidebar_layout.addWidget(self.appearance_btn)
 
-        self.keybinds_btn = QPushButton("Keybinds")
+        self.keybinds_btn = QPushButton("Keyboard Shortcuts")
         self.keybinds_btn.setProperty("class", "sidebarButton")
         self.keybinds_btn.setCheckable(True)
         self.nav_group.addButton(self.keybinds_btn, 1)
@@ -708,7 +741,7 @@ class SettingPanel(QWidget):
         kb_layout.setAlignment(Qt.AlignTop)
 
         kb_header_layout = QHBoxLayout()
-        kb_title = QLabel("Keybinds")
+        kb_title = QLabel("Keyboard Shortcuts")
         kb_title.setProperty("class", "pageTitle")
         kb_header_layout.addWidget(kb_title)
         kb_header_layout.addStretch()
@@ -780,3 +813,4 @@ class SettingPanel(QWidget):
 
         main_layout.addWidget(self.sidebar)
         main_layout.addWidget(self.content_stack)
+        
