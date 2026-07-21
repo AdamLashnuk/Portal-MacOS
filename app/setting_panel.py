@@ -57,70 +57,77 @@ _MAC_DEFAULT_KEYBINDS = {
 DEFAULT_KEYBINDS = _MAC_DEFAULT_KEYBINDS if sys.platform == "darwin" else _WINDOWS_DEFAULT_KEYBINDS
 
 class KeyCaptureEdit(QLineEdit):
-    """
-    Drop-in replacement for QKeySequenceEdit. QKeySequenceEdit calls
-    grabKeyboard() while recording, which appears to silently fail on
-    macOS because this app's main window uses the Qt.Popup flag —
-    popups already do their own keyboard/focus handling, and layering
-    another OS-level keyboard grab on top of that doesn't work reliably.
-
-    Because of that same Qt.Popup behavior, this widget's own
-    keyPressEvent isn't reliably delivered on macOS either. So instead
-    of depending on keyPressEvent, this widget installs an app-wide
-    event filter (on its top-level window, which implements
-    eventFilter) only while it's actively "capturing" a new shortcut,
-    and removes it immediately after. Keeping it installed at all times
-    was causing a native-level crash when opening the popup panel.
-    """
     keySequenceChanged = Signal(QKeySequence)
 
-    def __init__(self, initial_sequence=None, parent=None):
+    def __init__(self, initial_sequence=None, parent=None, panel=None):
         super().__init__(parent)
         self.setReadOnly(True)
+        self._panel = panel
         self._sequence = QKeySequence(initial_sequence) if initial_sequence else QKeySequence()
         self.setText(self._sequence.toString(QKeySequence.NativeText))
         self.setPlaceholderText("Press a key combo...")
         self.capturing = False
 
     def mousePressEvent(self, event):
+        print("--- DIAGNOSTIC: GRABBING KEYBOARD ---")
         self.capturing = True
         self.setText("")
-        super().mousePressEvent(event)
         self.setFocus(Qt.MouseFocusReason)
-        QApplication.instance().installEventFilter(self.window())
+        self.grabKeyboard()  # Forces macOS to send keystrokes directly here
+        super().mousePressEvent(event)
 
     def focusOutEvent(self, event):
         self.capturing = False
         self.setText(self._sequence.toString(QKeySequence.NativeText))
-        QApplication.instance().removeEventFilter(self.window())
+        self.releaseKeyboard()
         super().focusOutEvent(event)
 
-    def process_key_event(self, event):
+    def keyPressEvent(self, event):
+        print(f"--- DIAGNOSTIC: KEY PRESSED -> {event.key()} ---")
         key = event.key()
+        
+        # Build a list of currently held modifiers for visual feedback
+        mod_map = []
+        mods = event.modifiers()
+        if mods & Qt.MetaModifier: mod_map.append("Meta")
+        if mods & Qt.ControlModifier: mod_map.append("Ctrl")
+        if mods & Qt.AltModifier: mod_map.append("Alt")
+        if mods & Qt.ShiftModifier: mod_map.append("Shift")
+
+        # If it's JUST a modifier key being pressed, show it and wait
         if key in (Qt.Key_Control, Qt.Key_Shift, Qt.Key_Alt, Qt.Key_Meta):
+            if mod_map:
+                self.setText("+".join(mod_map) + "+...")
+            else:
+                self.setText("")
+            event.accept()
             return
 
-        modifiers = event.modifiers()
-        combo = 0
-        if modifiers & Qt.ControlModifier:
-            combo |= Qt.CTRL
-        if modifiers & Qt.ShiftModifier:
-            combo |= Qt.SHIFT
-        if modifiers & Qt.AltModifier:
-            combo |= Qt.ALT
-        if modifiers & Qt.MetaModifier:
-            combo |= Qt.META
-        combo |= key
-
-        seq = QKeySequence(combo)
+        # Otherwise, a full combo was pressed! Save it.
+        seq = QKeySequence(event.keyCombination())
         self._sequence = seq
         self.capturing = False
         self.setText(seq.toString(QKeySequence.NativeText))
-        QApplication.instance().removeEventFilter(self.window())
+        self.releaseKeyboard()
         self.keySequenceChanged.emit(seq)
+        self.clearFocus()
+        event.accept()
 
-    def keyPressEvent(self, event):
-        self.process_key_event(event)
+    def keyReleaseEvent(self, event):
+        # When a modifier is let go, update the visual feedback
+        key = event.key()
+        if key in (Qt.Key_Control, Qt.Key_Shift, Qt.Key_Alt, Qt.Key_Meta):
+            mod_map = []
+            mods = event.modifiers()
+            if mods & Qt.MetaModifier: mod_map.append("Meta")
+            if mods & Qt.ControlModifier: mod_map.append("Ctrl")
+            if mods & Qt.AltModifier: mod_map.append("Alt")
+            if mods & Qt.ShiftModifier: mod_map.append("Shift")
+            
+            if mod_map:
+                self.setText("+".join(mod_map) + "+...")
+            else:
+                self.setText("")
         event.accept()
 
     def keySequence(self):
@@ -276,12 +283,6 @@ class SettingPanel(QWidget):
         self.keybinds_updated.emit(self.current_keybinds)
     
     def eventFilter(self, obj, event):
-        if event.type() == QEvent.KeyPress and getattr(self, "keybind_widgets", None):
-            for widgets in self.keybind_widgets.values():
-                edit = widgets.get("edit")
-                if edit is not None and getattr(edit, "capturing", False):
-                    edit.process_key_event(event)
-                    return True
         return super().eventFilter(obj, event)
     
     def _migrate_legacy_color(self, legacy_value):
@@ -780,7 +781,7 @@ class SettingPanel(QWidget):
             toggle.setCursor(Qt.PointingHandCursor)
             toggle.setFixedWidth(65)
 
-            key_edit = KeyCaptureEdit(data["key"])
+            key_edit = KeyCaptureEdit(data["key"], panel=self)
             key_edit.setFixedWidth(180)
 
             toggle.toggled.connect(lambda checked, t=toggle, a=action_id: self._on_scope_toggled(t, a, checked))
