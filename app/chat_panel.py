@@ -336,8 +336,9 @@ class ChatPanel(QWidget):
             self.resize(900, 700)
 
         self.setWindowFlags(
-            Qt.Popup |
-            Qt.FramelessWindowHint
+            Qt.Tool |
+            Qt.FramelessWindowHint |
+            Qt.WindowStaysOnTopHint
         )
 
         self.setAttribute(Qt.WA_TranslucentBackground)

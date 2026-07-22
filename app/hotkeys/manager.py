@@ -4,7 +4,7 @@ from PySide6.QtCore import QObject
 from app.hotkeys.windows_backend import KeyboardLibBackend
 
 if sys.platform == "darwin":
-    from app.hotkeys.mac_backend import MacHotkeyBackend
+    from app.macos.mac_backend import MacHotkeyBackend
 
 
 class HotkeyManager(QObject):

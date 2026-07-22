@@ -8,6 +8,7 @@ from PySide6.QtCore import Qt, Signal, QSettings, QRect, QSize, QPoint, QTimer, 
 from PySide6.QtGui import QPixmap, QColor, QImage, QKeySequence, QPainter, QBrush
 
 from app.utils import get_asset_path
+from app.macos.focus_promoter import FocusPromoter
 
 import sys
 
@@ -69,24 +70,25 @@ class KeyCaptureEdit(QLineEdit):
         self.capturing = False
 
     def mousePressEvent(self, event):
-        print("--- DIAGNOSTIC: GRABBING KEYBOARD ---")
         self.capturing = True
         self.setText("")
+        FocusPromoter.promote(self.window())
         self.setFocus(Qt.MouseFocusReason)
-        self.grabKeyboard()  # Forces macOS to send keystrokes directly here
+        #self.grabKeyboard()
+        print("KeyCaptureEdit: hasFocus =", self.hasFocus())
         super().mousePressEvent(event)
 
     def focusOutEvent(self, event):
         self.capturing = False
         self.setText(self._sequence.toString(QKeySequence.NativeText))
-        self.releaseKeyboard()
+        #self.releaseKeyboard()
+        FocusPromoter.demote()
         super().focusOutEvent(event)
 
     def keyPressEvent(self, event):
-        print(f"--- DIAGNOSTIC: KEY PRESSED -> {event.key()} ---")
+        print("KeyCaptureEdit: keyPressEvent fired, key =", event.key())
         key = event.key()
-        
-        # Build a list of currently held modifiers for visual feedback
+
         mod_map = []
         mods = event.modifiers()
         if mods & Qt.MetaModifier: mod_map.append("Meta")
@@ -94,7 +96,6 @@ class KeyCaptureEdit(QLineEdit):
         if mods & Qt.AltModifier: mod_map.append("Alt")
         if mods & Qt.ShiftModifier: mod_map.append("Shift")
 
-        # If it's JUST a modifier key being pressed, show it and wait
         if key in (Qt.Key_Control, Qt.Key_Shift, Qt.Key_Alt, Qt.Key_Meta):
             if mod_map:
                 self.setText("+".join(mod_map) + "+...")
@@ -102,6 +103,16 @@ class KeyCaptureEdit(QLineEdit):
                 self.setText("")
             event.accept()
             return
+
+        seq = QKeySequence(event.keyCombination())
+        self._sequence = seq
+        self.capturing = False
+        self.setText(seq.toString(QKeySequence.NativeText))
+        #self.releaseKeyboard()
+        FocusPromoter.demote()
+        self.keySequenceChanged.emit(seq)
+        self.clearFocus()
+        event.accept()
 
         # Otherwise, a full combo was pressed! Save it.
         seq = QKeySequence(event.keyCombination())
