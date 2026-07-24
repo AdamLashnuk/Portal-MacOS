@@ -17,6 +17,7 @@ from PySide6.QtWebEngineCore import QWebEngineProfile, QWebEnginePage, QWebEngin
 from app.setting_panel import SettingPanel
 from app.utils import get_asset_path
 from app.multitask.sender import MultitaskSender
+from app.macos.window_level import WindowLevelController
 
 
 class GlobalHotkeyBridge(QObject):
@@ -272,6 +273,7 @@ class ChatPanel(QWidget):
 
             if panel_was_visible:
                 self.show()
+                WindowLevelController.set_pinned(self, not is_pinned)   # <-- here
 
             if self.bubble:
                 bubble_was_visible = self.bubble.isVisible()
@@ -282,6 +284,7 @@ class ChatPanel(QWidget):
 
                 if bubble_was_visible:
                     self.bubble.show()
+                    WindowLevelController.set_pinned(self.bubble, not is_pinned)   # <-- and here
 
     def cycle_next_llm(self):
         if not self.active_llms: return
