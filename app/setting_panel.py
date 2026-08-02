@@ -8,6 +8,7 @@ from PySide6.QtCore import Qt, Signal, QSettings, QRect, QSize, QPoint, QTimer, 
 from PySide6.QtGui import QPixmap, QColor, QImage, QKeySequence, QPainter, QBrush
 
 from app.utils import get_asset_path
+from app.hotkeys.key_sequences import canonical_to_qt, qt_to_canonical
 from app.macos.focus_promoter import FocusPromoter
 
 import sys
@@ -57,15 +58,23 @@ _MAC_DEFAULT_KEYBINDS = {
 
 DEFAULT_KEYBINDS = _MAC_DEFAULT_KEYBINDS if sys.platform == "darwin" else _WINDOWS_DEFAULT_KEYBINDS
 
+def _native_display(key_str: str) -> str:
+    """Render a canonical Portal shortcut with the platform's native symbols."""
+    if not key_str:
+        return ""
+    qt_sequence = QKeySequence(canonical_to_qt(key_str))
+    return qt_sequence.toString(QKeySequence.NativeText)
+
 class KeyCaptureEdit(QLineEdit):
-    keySequenceChanged = Signal(QKeySequence)
+    keySequenceChanged = Signal(str)
 
     def __init__(self, initial_sequence=None, parent=None, panel=None):
         super().__init__(parent)
         self.setReadOnly(True)
         self._panel = panel
-        self._sequence = QKeySequence(initial_sequence) if initial_sequence else QKeySequence()
-        self.setText(self._sequence.toString(QKeySequence.NativeText))
+        self._canonical_sequence = initial_sequence or ""
+        self._sequence = QKeySequence(canonical_to_qt(self._canonical_sequence))
+        self.setText(_native_display(self._canonical_sequence))
         self.setPlaceholderText("Press a key combo...")
         self.capturing = False
 
@@ -80,47 +89,45 @@ class KeyCaptureEdit(QLineEdit):
 
     def focusOutEvent(self, event):
         self.capturing = False
-        self.setText(self._sequence.toString(QKeySequence.NativeText))
+        self.setText(_native_display(self._canonical_sequence))
         #self.releaseKeyboard()
         FocusPromoter.demote()
         super().focusOutEvent(event)
+
+    @staticmethod
+    def _modifier_preview(modifiers):
+        qt_modifiers = []
+        if modifiers & Qt.ControlModifier:
+            qt_modifiers.append("Ctrl")
+        if modifiers & Qt.AltModifier:
+            qt_modifiers.append("Alt")
+        if modifiers & Qt.ShiftModifier:
+            qt_modifiers.append("Shift")
+        if modifiers & Qt.MetaModifier:
+            qt_modifiers.append("Meta")
+        if not qt_modifiers:
+            return ""
+        return qt_to_canonical("+".join(qt_modifiers + ["..."]))
 
     def keyPressEvent(self, event):
         print("KeyCaptureEdit: keyPressEvent fired, key =", event.key())
         key = event.key()
 
-        mod_map = []
         mods = event.modifiers()
-        if mods & Qt.MetaModifier: mod_map.append("Meta")
-        if mods & Qt.ControlModifier: mod_map.append("Ctrl")
-        if mods & Qt.AltModifier: mod_map.append("Alt")
-        if mods & Qt.ShiftModifier: mod_map.append("Shift")
 
         if key in (Qt.Key_Control, Qt.Key_Shift, Qt.Key_Alt, Qt.Key_Meta):
-            if mod_map:
-                self.setText("+".join(mod_map) + "+...")
-            else:
-                self.setText("")
+            self.setText(self._modifier_preview(mods))
             event.accept()
             return
 
         seq = QKeySequence(event.keyCombination())
         self._sequence = seq
+        self._canonical_sequence = qt_to_canonical(seq.toString())
         self.capturing = False
-        self.setText(seq.toString(QKeySequence.NativeText))
+        self.setText(_native_display(self._canonical_sequence))
         #self.releaseKeyboard()
         FocusPromoter.demote()
-        self.keySequenceChanged.emit(seq)
-        self.clearFocus()
-        event.accept()
-
-        # Otherwise, a full combo was pressed! Save it.
-        seq = QKeySequence(event.keyCombination())
-        self._sequence = seq
-        self.capturing = False
-        self.setText(seq.toString(QKeySequence.NativeText))
-        self.releaseKeyboard()
-        self.keySequenceChanged.emit(seq)
+        self.keySequenceChanged.emit(self._canonical_sequence)
         self.clearFocus()
         event.accept()
 
@@ -128,26 +135,18 @@ class KeyCaptureEdit(QLineEdit):
         # When a modifier is let go, update the visual feedback
         key = event.key()
         if key in (Qt.Key_Control, Qt.Key_Shift, Qt.Key_Alt, Qt.Key_Meta):
-            mod_map = []
-            mods = event.modifiers()
-            if mods & Qt.MetaModifier: mod_map.append("Meta")
-            if mods & Qt.ControlModifier: mod_map.append("Ctrl")
-            if mods & Qt.AltModifier: mod_map.append("Alt")
-            if mods & Qt.ShiftModifier: mod_map.append("Shift")
-            
-            if mod_map:
-                self.setText("+".join(mod_map) + "+...")
-            else:
-                self.setText("")
+            self.setText(self._modifier_preview(event.modifiers()))
         event.accept()
 
     def keySequence(self):
         return self._sequence
 
     def setKeySequence(self, seq):
-        self._sequence = QKeySequence(seq)
+        self._canonical_sequence = seq.toString() if isinstance(seq, QKeySequence) else str(seq)
+        self._sequence = QKeySequence(canonical_to_qt(self._canonical_sequence))
         self.capturing = False
-        self.setText(self._sequence.toString(QKeySequence.NativeText))
+        self.setText(_native_display(self._canonical_sequence))
+
 
 class CustomSlider(QWidget):
     valueChanged = Signal(int)
@@ -366,7 +365,7 @@ class SettingPanel(QWidget):
                 w["edit"].blockSignals(True)
                 w["toggle"].blockSignals(True)
 
-                w["edit"].setKeySequence(QKeySequence(data["key"]))
+                w["edit"].setKeySequence(data["key"])
                 w["toggle"].setChecked(data["is_global"])
                 w["toggle"].setText("Global" if data["is_global"] else "Local")
                 w["label"].setText(data["label"])  # <-- THIS NEW LINE UPDATES THE TEXT
@@ -796,7 +795,10 @@ class SettingPanel(QWidget):
             key_edit.setFixedWidth(180)
 
             toggle.toggled.connect(lambda checked, t=toggle, a=action_id: self._on_scope_toggled(t, a, checked))
-            key_edit.keySequenceChanged.connect(lambda seq, a=action_id: self.update_keybind_seq(a, seq.toString()))
+            key_edit.keySequenceChanged.connect(
+                lambda canonical_sequence, a=action_id:
+                self.update_keybind_seq(a, canonical_sequence)
+            )
 
             row_layout.addWidget(toggle)
             row_layout.addSpacing(10)
@@ -825,4 +827,3 @@ class SettingPanel(QWidget):
 
         main_layout.addWidget(self.sidebar)
         main_layout.addWidget(self.content_stack)
-        

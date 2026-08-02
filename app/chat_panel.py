@@ -17,6 +17,7 @@ from PySide6.QtWebEngineCore import QWebEngineProfile, QWebEnginePage, QWebEngin
 from app.setting_panel import SettingPanel
 from app.utils import get_asset_path
 from app.multitask.sender import MultitaskSender
+from app.hotkeys.key_sequences import canonical_to_qt
 from app.macos.window_level import WindowLevelController
 
 
@@ -216,7 +217,7 @@ class ChatPanel(QWidget):
                 if not ok:
                     print(f"Failed to bind global hotkey for {action_id}: {key_str}")
             else:
-                sc = QShortcut(QKeySequence(key_str), self)
+                sc = QShortcut(QKeySequence(canonical_to_qt(key_str)), self)
                 sc.activated.connect(lambda a=action_id: self.execute_hotkey_action(a))
                 self.local_shortcuts.append(sc)
 
