@@ -2,150 +2,38 @@ import os
 import json
 import copy
 import sys as sys_module
-from PySide6.QtWidgets import (QComboBox, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame, QStackedWidget,
-                               QButtonGroup, QKeySequenceEdit, QSlider, QLayout, QSizePolicy, QLineEdit, QApplication)
-from PySide6.QtCore import Qt, Signal, QSettings, QRect, QSize, QPoint, QTimer, QEvent
+from PySide6.QtWidgets import (QApplication, QComboBox, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame, QStackedWidget,
+                               QButtonGroup, QKeySequenceEdit, QLineEdit, QSlider, QLayout, QSizePolicy)
+from PySide6.QtCore import Qt, QEvent, Signal, QSettings, QRect, QSize, QPoint
 from PySide6.QtGui import QPixmap, QColor, QImage, QKeySequence, QPainter, QBrush
 
-from app.utils import get_asset_path
 from app.hotkeys.key_sequences import canonical_to_qt, qt_to_canonical
 from app.macos.focus_promoter import FocusPromoter
+from app.utils import get_asset_path
 
-import sys
-
-print("Platform:", sys.platform)
 _WINDOWS_DEFAULT_KEYBINDS = {
     "summon": {"label": "Summon Panel", "key": "Ctrl+Space", "is_global": True},
     "hide": {"label": "Hide Panel", "key": "Esc", "is_global": False},
     "next_llm": {"label": "Next LLM", "key": "Ctrl+Tab", "is_global": False},
     "refresh": {"label": "Hard Refresh", "key": "F5", "is_global": False},
     "quick_refresh": {"label": "Quick Refresh", "key": "Ctrl+R", "is_global": False},
-    "pin_toggle": {"label": "Toggle Pin", "key": "Alt+P", "is_global": True},
+    "pin_toggle": {"label": "Toggle Pin", "key": "Alt+P", "is_global": True}
 }
 
 _MAC_DEFAULT_KEYBINDS = {
-    "summon": {
-        "label": "Summon Panel",
-        "key": "Meta+Shift+Space",
-        "is_global": True
-    },
-    "hide": {
-        "label": "Hide Panel",
-        "key": "Esc",
-        "is_global": False
-    },
-    "next_llm": {
-        "label": "Next LLM",
-        "key": "Meta+Shift+]",
-        "is_global": False
-    },
-    "refresh": {
-        "label": "Hard Refresh",
-        "key": "Meta+Shift+R",
-        "is_global": False
-    },
-    "quick_refresh": {
-        "label": "Quick Refresh",
-        "key": "Meta+R",
-        "is_global": False
-    },
-    "pin_toggle": {
-        "label": "Toggle Pin",
-        "key": "Meta+Alt+P",
-        "is_global": True
-    },
+    "summon": {"label": "Summon Panel", "key": "Meta+Shift+Space", "is_global": True},
+    "hide": {"label": "Hide Panel", "key": "Esc", "is_global": False},
+    "next_llm": {"label": "Next LLM", "key": "Meta+Shift+]", "is_global": False},
+    "refresh": {"label": "Hard Refresh", "key": "Meta+Shift+R", "is_global": False},
+    "quick_refresh": {"label": "Quick Refresh", "key": "Meta+R", "is_global": False},
+    "pin_toggle": {"label": "Toggle Pin", "key": "Meta+Alt+P", "is_global": True},
 }
 
-DEFAULT_KEYBINDS = _MAC_DEFAULT_KEYBINDS if sys.platform == "darwin" else _WINDOWS_DEFAULT_KEYBINDS
-
-def _native_display(key_str: str) -> str:
-    """Render a canonical Portal shortcut with the platform's native symbols."""
-    if not key_str:
-        return ""
-    qt_sequence = QKeySequence(canonical_to_qt(key_str))
-    return qt_sequence.toString(QKeySequence.NativeText)
-
-class KeyCaptureEdit(QLineEdit):
-    keySequenceChanged = Signal(str)
-
-    def __init__(self, initial_sequence=None, parent=None, panel=None):
-        super().__init__(parent)
-        self.setReadOnly(True)
-        self._panel = panel
-        self._canonical_sequence = initial_sequence or ""
-        self._sequence = QKeySequence(canonical_to_qt(self._canonical_sequence))
-        self.setText(_native_display(self._canonical_sequence))
-        self.setPlaceholderText("Press a key combo...")
-        self.capturing = False
-
-    def mousePressEvent(self, event):
-        self.capturing = True
-        self.setText("")
-        FocusPromoter.promote(self.window())
-        self.setFocus(Qt.MouseFocusReason)
-        #self.grabKeyboard()
-        print("KeyCaptureEdit: hasFocus =", self.hasFocus())
-        super().mousePressEvent(event)
-
-    def focusOutEvent(self, event):
-        self.capturing = False
-        self.setText(_native_display(self._canonical_sequence))
-        #self.releaseKeyboard()
-        FocusPromoter.demote()
-        super().focusOutEvent(event)
-
-    @staticmethod
-    def _modifier_preview(modifiers):
-        qt_modifiers = []
-        if modifiers & Qt.ControlModifier:
-            qt_modifiers.append("Ctrl")
-        if modifiers & Qt.AltModifier:
-            qt_modifiers.append("Alt")
-        if modifiers & Qt.ShiftModifier:
-            qt_modifiers.append("Shift")
-        if modifiers & Qt.MetaModifier:
-            qt_modifiers.append("Meta")
-        if not qt_modifiers:
-            return ""
-        return qt_to_canonical("+".join(qt_modifiers + ["..."]))
-
-    def keyPressEvent(self, event):
-        print("KeyCaptureEdit: keyPressEvent fired, key =", event.key())
-        key = event.key()
-
-        mods = event.modifiers()
-
-        if key in (Qt.Key_Control, Qt.Key_Shift, Qt.Key_Alt, Qt.Key_Meta):
-            self.setText(self._modifier_preview(mods))
-            event.accept()
-            return
-
-        seq = QKeySequence(event.keyCombination())
-        self._sequence = seq
-        self._canonical_sequence = qt_to_canonical(seq.toString())
-        self.capturing = False
-        self.setText(_native_display(self._canonical_sequence))
-        #self.releaseKeyboard()
-        FocusPromoter.demote()
-        self.keySequenceChanged.emit(self._canonical_sequence)
-        self.clearFocus()
-        event.accept()
-
-    def keyReleaseEvent(self, event):
-        # When a modifier is let go, update the visual feedback
-        key = event.key()
-        if key in (Qt.Key_Control, Qt.Key_Shift, Qt.Key_Alt, Qt.Key_Meta):
-            self.setText(self._modifier_preview(event.modifiers()))
-        event.accept()
-
-    def keySequence(self):
-        return self._sequence
-
-    def setKeySequence(self, seq):
-        self._canonical_sequence = seq.toString() if isinstance(seq, QKeySequence) else str(seq)
-        self._sequence = QKeySequence(canonical_to_qt(self._canonical_sequence))
-        self.capturing = False
-        self.setText(_native_display(self._canonical_sequence))
+DEFAULT_KEYBINDS = (
+    _MAC_DEFAULT_KEYBINDS
+    if sys_module.platform == "darwin"
+    else _WINDOWS_DEFAULT_KEYBINDS
+)
 
 
 class CustomSlider(QWidget):
@@ -232,10 +120,104 @@ class CustomSlider(QWidget):
             self.update()
 
 
+class ShortcutKeySequenceEdit(QKeySequenceEdit):
+    capture_started = Signal()
+    capture_cancelled = Signal()
+
+    def __init__(self, sequence, parent=None):
+        qt_sequence = QKeySequence(canonical_to_qt(sequence))
+        super().__init__(qt_sequence, parent)
+        self._capturing = False
+        self._previous_sequence = QKeySequence(qt_sequence)
+        self.setProperty("shortcutHovered", False)
+        self.setMouseTracking(True)
+
+        line_edit = self.findChild(QLineEdit)
+        if line_edit:
+            line_edit.setMouseTracking(True)
+            line_edit.installEventFilter(self)
+
+    def _set_hovered(self, hovered):
+        if self.property("shortcutHovered") == hovered:
+            return
+
+        self.setProperty("shortcutHovered", hovered)
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+    def _is_editor_widget(self, widget):
+        current = widget if isinstance(widget, QWidget) else None
+        while current:
+            if current is self:
+                return True
+            current = current.parentWidget()
+        return False
+
+    def _set_capture_placeholder(self, text):
+        line_edit = self.findChild(QLineEdit)
+        if line_edit:
+            line_edit.setPlaceholderText(text)
+
+    def focusInEvent(self, event):
+        super().focusInEvent(event)
+        if self._capturing:
+            return
+
+        FocusPromoter.promote(self.window())
+        self._capturing = True
+        self._previous_sequence = self.keySequence()
+
+        # Clear the visible value without saving an empty shortcut. The
+        # placeholder then tells the user exactly what to do next.
+        self.blockSignals(True)
+        self.clear()
+        self.blockSignals(False)
+
+        self._set_capture_placeholder("Press a shortcut...")
+        app = QApplication.instance()
+        if app:
+            app.installEventFilter(self)
+        self.capture_started.emit()
+
+    def focusOutEvent(self, event):
+        if self._capturing and self.keySequence().isEmpty():
+            # A click away without entering keys should leave the saved
+            # shortcut untouched and restore what the user had before.
+            self.blockSignals(True)
+            self.setKeySequence(self._previous_sequence)
+            self.blockSignals(False)
+            self.capture_cancelled.emit()
+
+        self._capturing = False
+        app = QApplication.instance()
+        if app:
+            app.removeEventFilter(self)
+        self._set_capture_placeholder("")
+        FocusPromoter.demote()
+        super().focusOutEvent(event)
+
+    def eventFilter(self, watched, event):
+        if isinstance(watched, QLineEdit) and self._is_editor_widget(watched):
+            if event.type() == QEvent.Type.Enter:
+                self._set_hovered(True)
+            elif event.type() == QEvent.Type.Leave:
+                self._set_hovered(False)
+
+        if (
+            self._capturing
+            and event.type() == QEvent.Type.MouseButtonPress
+            and not self._is_editor_widget(watched)
+        ):
+            self.clearFocus()
+
+        return super().eventFilter(watched, event)
+
+
 class SettingPanel(QWidget):
     color_changed = Signal(str)
     opacity_changed = Signal(int)
-    clear_data_requested = Signal()
+    clear_current_data_requested = Signal()
+    clear_all_data_requested = Signal()
     keybinds_updated = Signal(dict)  # Tells ChatPanel to reload its shortcuts
 
     def __init__(self):
@@ -278,7 +260,16 @@ class SettingPanel(QWidget):
             QPushButton.dangerButton:hover { background-color: rgba(220, 38, 38, 0.25); color: #fca5a5; }
 
             /* --- Keybinds UI Styling --- */
-            QKeySequenceEdit { background-color: #151515; border: 1px solid #333333; border-radius: 6px; color: #ffffff; padding: 6px 10px; }
+            QKeySequenceEdit { background-color: #242424; border: 1px solid transparent; border-radius: 14px; color: #ececec; padding: 6px 12px; }
+            QKeySequenceEdit QLineEdit { background-color: #242424; border: 1px solid #242424; border-radius: 12px; color: #ececec; padding: 0; }
+            QKeySequenceEdit QLineEdit::placeholder { color: #a3a3a3; }
+            QKeySequenceEdit:hover { background-color: #2a2a2a; border-color: #4a4a4a; }
+            QKeySequenceEdit:hover QLineEdit { background-color: #2a2a2a; border-color: #2a2a2a; border-radius: 12px; }
+            QKeySequenceEdit QLineEdit:hover { border-color: #4a4a4a; }
+            QKeySequenceEdit[shortcutHovered="true"] QLineEdit { background-color: #2a2a2a; border-color: #4a4a4a; }
+            QKeySequenceEdit:focus { background-color: #2a2a2a; border-color: #737373; }
+            QKeySequenceEdit:focus QLineEdit { background-color: #2a2a2a; border-color: #2a2a2a; border-radius: 12px; }
+            QKeySequenceEdit QLineEdit:focus { border-color: #737373; }
             QPushButton.scopeToggle { background-color: #242424; color: #b4b4b4; border: 1px solid #333333; border-radius: 6px; padding: 6px 0px; font-size: 13px; min-height: 18px; }
             QPushButton.scopeToggle:hover { background-color: #2a2a2a; color: #ececec; }
             QPushButton.scopeToggle:checked { color: #818cf8; border: 1px solid #6366f1; background-color: rgba(99, 102, 241, 0.1); }
@@ -291,10 +282,7 @@ class SettingPanel(QWidget):
         self.settings.setValue("shortcuts", json.dumps(self.current_keybinds))
         self.settings.sync()
         self.keybinds_updated.emit(self.current_keybinds)
-    
-    def eventFilter(self, obj, event):
-        return super().eventFilter(obj, event)
-    
+
     def _migrate_legacy_color(self, legacy_value):
         """
         Pulls a base RGB + opacity percentage out of an old-style saved
@@ -349,13 +337,18 @@ class SettingPanel(QWidget):
         self.current_keybinds[action_id]["key"] = seq_str
         self.save_all_keybinds()
 
-    def _on_scope_toggled(self, toggle_btn, action_id, checked):
-        toggle_btn.setText("Global" if checked else "Local")
-        QTimer.singleShot(0, lambda: self.update_keybind_scope(action_id, checked))
-
     def update_keybind_scope(self, action_id, is_global):
         self.current_keybinds[action_id]["is_global"] = is_global
         self.save_all_keybinds()
+
+    @staticmethod
+    def size_keybind_editor(key_edit):
+        shortcut_text = (
+            key_edit.keySequence().toString(QKeySequence.NativeText)
+            or "Set shortcut"
+        )
+        text_width = key_edit.fontMetrics().horizontalAdvance(shortcut_text)
+        key_edit.setFixedWidth(max(96, min(text_width + 32, 160)))
 
     def reset_keybinds(self):
         self.current_keybinds = copy.deepcopy(DEFAULT_KEYBINDS)
@@ -365,7 +358,10 @@ class SettingPanel(QWidget):
                 w["edit"].blockSignals(True)
                 w["toggle"].blockSignals(True)
 
-                w["edit"].setKeySequence(data["key"])
+                w["edit"].setKeySequence(
+                    QKeySequence(canonical_to_qt(data["key"]))
+                )
+                self.size_keybind_editor(w["edit"])
                 w["toggle"].setChecked(data["is_global"])
                 w["toggle"].setText("Global" if data["is_global"] else "Local")
                 w["label"].setText(data["label"])  # <-- THIS NEW LINE UPDATES THE TEXT
@@ -428,7 +424,7 @@ class SettingPanel(QWidget):
         self.nav_group.addButton(self.appearance_btn, 0)
         sidebar_layout.addWidget(self.appearance_btn)
 
-        self.keybinds_btn = QPushButton("Keyboard Shortcuts")
+        self.keybinds_btn = QPushButton("Keybinds")
         self.keybinds_btn.setProperty("class", "sidebarButton")
         self.keybinds_btn.setCheckable(True)
         self.nav_group.addButton(self.keybinds_btn, 1)
@@ -452,10 +448,25 @@ class SettingPanel(QWidget):
         app_title.setProperty("class", "pageTitle")
         app_layout.addWidget(app_title)
 
+        appearance_card = QFrame()
+        appearance_card.setProperty("class", "settingCard")
+        appearance_card_layout = QVBoxLayout(appearance_card)
+        appearance_card_layout.setContentsMargins(20, 20, 20, 20)
+        appearance_card_layout.setSpacing(14)
+
+        def add_appearance_section(section):
+            if appearance_card_layout.count() > 0:
+                divider = QFrame()
+                divider.setFixedHeight(1)
+                divider.setProperty("class", "rowDivider")
+                appearance_card_layout.addWidget(divider)
+
+            appearance_card_layout.addWidget(section)
+
         color_card = QFrame()
-        color_card.setProperty("class", "settingCard")
+        color_card.setObjectName("transparentWidget")
         color_card_layout = QVBoxLayout(color_card)
-        color_card_layout.setContentsMargins(20, 20, 20, 20)
+        color_card_layout.setContentsMargins(0, 0, 0, 0)
         color_card_layout.setSpacing(15)
 
         resize_title = QLabel("Window Color")
@@ -565,12 +576,12 @@ class SettingPanel(QWidget):
             self.btn_grey.setChecked(True)
 
         color_card_layout.addLayout(color_layout)
-        app_layout.addWidget(color_card)
+        add_appearance_section(color_card)
 
         opacity_card = QFrame()
-        opacity_card.setProperty("class", "settingCard")
+        opacity_card.setObjectName("transparentWidget")
         opacity_card_layout = QVBoxLayout(opacity_card)
-        opacity_card_layout.setContentsMargins(20, 20, 20, 20)
+        opacity_card_layout.setContentsMargins(0, 0, 0, 0)
         opacity_card_layout.setSpacing(15)
 
         opacity_caption = QLabel("Background Opacity")
@@ -594,14 +605,14 @@ class SettingPanel(QWidget):
         opacity_row.addWidget(self.opacity_value_label)
         opacity_card_layout.addLayout(opacity_row)
 
-        app_layout.addWidget(opacity_card)
+        add_appearance_section(opacity_card)
 
         # --- WIDGET STARTUP POSITION CARD ---
         startup_pos_card = QFrame()
-        startup_pos_card.setProperty("class", "settingCard")
+        startup_pos_card.setObjectName("transparentWidget")
 
         startup_pos_layout = QVBoxLayout(startup_pos_card)
-        startup_pos_layout.setContentsMargins(20, 20, 20, 20)
+        startup_pos_layout.setContentsMargins(0, 0, 0, 0)
         startup_pos_layout.setSpacing(12)
 
         startup_pos_title = QLabel("Widget Startup Position")
@@ -671,15 +682,15 @@ class SettingPanel(QWidget):
 
         startup_pos_layout.addLayout(startup_buttons_layout)
 
-        app_layout.addWidget(startup_pos_card)
+        add_appearance_section(startup_pos_card)
 
-        if sys_module.platform == "win32":
+        if sys_module.platform in ("win32", "darwin"):
             from app.utils import set_startup, check_startup_enabled
 
             startup_card = QFrame()
-            startup_card.setProperty("class", "settingCard")
+            startup_card.setObjectName("transparentWidget")
             startup_card_layout = QVBoxLayout(startup_card)
-            startup_card_layout.setContentsMargins(20, 20, 20, 20)
+            startup_card_layout.setContentsMargins(0, 0, 0, 0)
             startup_card_layout.setSpacing(12)
 
             startup_title = QLabel("System")
@@ -691,15 +702,16 @@ class SettingPanel(QWidget):
             self.btn_startup.setCheckable(True)
             self.btn_startup.setCursor(Qt.PointingHandCursor)
             
-            # Reads the actual Windows Registry to see if it should be checked visually
+            # Read the platform's real launch-at-login configuration.
             self.btn_startup.setChecked(check_startup_enabled())
 
-            # When clicked, update the registry automatically
+            # Update the Windows registry or macOS LaunchAgent.
             self.btn_startup.toggled.connect(lambda checked: set_startup(checked))
 
             startup_card_layout.addWidget(self.btn_startup)
-            app_layout.addWidget(startup_card)
+            add_appearance_section(startup_card)
 
+        app_layout.addWidget(appearance_card)
 
         self.btn_transparent.clicked.connect(lambda: self._on_color_selected(self.btn_transparent))
         self.btn_grey.clicked.connect(lambda: self._on_color_selected(self.btn_grey))
@@ -730,18 +742,31 @@ class SettingPanel(QWidget):
         priv_card_layout.addWidget(danger_title)
 
         danger_desc = QLabel(
-            "This will instantly log you out of all AI providers, clear your active session cookies, and wipe the widget's internal cache. Use this to protect your privacy or if a website is stuck in an endless login loop.")
+            "Reset only the selected tab's isolated session, or clear every "
+            "AI provider session in Portal. Affected tabs will be logged out "
+            "and restarted with clean browsing data."
+        )
         danger_desc.setProperty("class", "cardText")
         danger_desc.setWordWrap(True)
         priv_card_layout.addWidget(danger_desc)
 
-        self.btn_clear_data = QPushButton("Clear All Data && Cookies")
-        self.btn_clear_data.setProperty("class", "dangerButton")
-        self.btn_clear_data.setCursor(Qt.PointingHandCursor)
-        self.btn_clear_data.clicked.connect(lambda: self.clear_data_requested.emit())
+        self.btn_clear_current_data = QPushButton("Clear Current Tab")
+        self.btn_clear_current_data.setProperty("class", "dangerButton")
+        self.btn_clear_current_data.setCursor(Qt.PointingHandCursor)
+        self.btn_clear_current_data.clicked.connect(
+            lambda: self.clear_current_data_requested.emit()
+        )
+
+        self.btn_clear_all_data = QPushButton("Clear All Providers")
+        self.btn_clear_all_data.setProperty("class", "dangerButton")
+        self.btn_clear_all_data.setCursor(Qt.PointingHandCursor)
+        self.btn_clear_all_data.clicked.connect(
+            lambda: self.clear_all_data_requested.emit()
+        )
 
         btn_layout = QHBoxLayout()
-        btn_layout.addWidget(self.btn_clear_data)
+        btn_layout.addWidget(self.btn_clear_current_data)
+        btn_layout.addWidget(self.btn_clear_all_data)
         btn_layout.addStretch()
         priv_card_layout.addLayout(btn_layout)
         priv_layout.addWidget(priv_card)
@@ -752,7 +777,7 @@ class SettingPanel(QWidget):
         kb_layout.setAlignment(Qt.AlignTop)
 
         kb_header_layout = QHBoxLayout()
-        kb_title = QLabel("Keyboard Shortcuts")
+        kb_title = QLabel("Keybinds")
         kb_title.setProperty("class", "pageTitle")
         kb_header_layout.addWidget(kb_title)
         kb_header_layout.addStretch()
@@ -791,14 +816,24 @@ class SettingPanel(QWidget):
             toggle.setCursor(Qt.PointingHandCursor)
             toggle.setFixedWidth(65)
 
-            key_edit = KeyCaptureEdit(data["key"], panel=self)
-            key_edit.setFixedWidth(180)
+            key_edit = ShortcutKeySequenceEdit(data["key"])
+            key_edit.setCursor(Qt.PointingHandCursor)
+            key_edit.setToolTip("Click to change shortcut")
+            self.size_keybind_editor(key_edit)
 
-            toggle.toggled.connect(lambda checked, t=toggle, a=action_id: self._on_scope_toggled(t, a, checked))
-            key_edit.keySequenceChanged.connect(
-                lambda canonical_sequence, a=action_id:
-                self.update_keybind_seq(a, canonical_sequence)
-            )
+            toggle.toggled.connect(lambda checked, t=toggle, a=action_id: [t.setText("Global" if checked else "Local"),
+                                                                           self.update_keybind_scope(a, checked)])
+
+            def handle_key_sequence_changed(seq, action=action_id, editor=key_edit):
+                self.update_keybind_seq(
+                    action,
+                    qt_to_canonical(seq.toString(QKeySequence.PortableText)),
+                )
+                self.size_keybind_editor(editor)
+
+            key_edit.keySequenceChanged.connect(handle_key_sequence_changed)
+            key_edit.capture_started.connect(lambda editor=key_edit: self.size_keybind_editor(editor))
+            key_edit.capture_cancelled.connect(lambda editor=key_edit: self.size_keybind_editor(editor))
 
             row_layout.addWidget(toggle)
             row_layout.addSpacing(10)

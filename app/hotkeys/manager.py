@@ -1,10 +1,10 @@
 import sys
 from PySide6.QtCore import QObject
 
-from app.hotkeys.windows_backend import KeyboardLibBackend
-
 if sys.platform == "darwin":
     from app.macos.mac_backend import MacHotkeyBackend
+else:
+    from app.hotkeys.windows_backend import KeyboardLibBackend
 
 
 class HotkeyManager(QObject):

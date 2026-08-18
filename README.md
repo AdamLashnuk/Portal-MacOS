@@ -111,4 +111,4 @@ python main.py
 
 ## 📄 License
 
-Copyright (c) 2026 Adam Lashnuk, Faris Felamban, Ahmed Abuharba
+Copyright (c) 2026 Adam Lashnuk, Faris Felemban, Ahmed Abuharba

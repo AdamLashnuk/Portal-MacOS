@@ -1,8 +1,10 @@
 import os
 import json
 import uuid
-from app.hotkeys.manager import HotkeyManager
 import re
+import shutil
+import threading
+import time
 from PySide6.QtWidgets import (QFileDialog, QWidget, QPushButton, QVBoxLayout, QHBoxLayout, QLabel,
                                QFrame, QRubberBand, QGraphicsOpacityEffect, QSizePolicy,
                                QScrollArea, QDialog, QLineEdit, QListWidget, QListWidgetItem,
@@ -15,10 +17,67 @@ from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEngineProfile, QWebEnginePage, QWebEngineSettings
 
 from app.setting_panel import SettingPanel
-from app.utils import get_asset_path
-from app.multitask.sender import MultitaskSender
+from app.hotkeys.manager import HotkeyManager
 from app.hotkeys.key_sequences import canonical_to_qt
 from app.macos.window_level import WindowLevelController
+from app.tab_reorder import ReorderableTabButton, TabReorderController
+from app.utils import get_asset_path
+
+
+class PortalWebEngineView(QWebEngineView):
+    """QWebEngineView that supports real JavaScript popup windows.
+
+    OAuth providers (including Claude's Google sign-in flow) commonly launch
+    authentication with window.open()/target=_blank. A plain QWebEngineView
+    has nowhere to put that new window, so the click can appear to do nothing.
+
+    The popup deliberately uses the SAME QWebEngineProfile as its opener so
+    cookies/session state created during sign-in are visible to the original
+    Claude tab when the popup closes.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._popup_windows = []
+
+    def createWindow(self, window_type):
+        popup = PortalWebEngineView()
+        popup.setAttribute(Qt.WA_DeleteOnClose, True)
+        popup.setWindowTitle("Portal Sign In")
+        popup.resize(560, 760)
+
+        # Critical: keep OAuth cookies/session in the same profile as the
+        # browser that opened this popup.
+        opener_page = self.page()
+        if opener_page is not None:
+            popup_page = QWebEnginePage(opener_page.profile(), popup)
+            popup.setPage(popup_page)
+
+        # Match the capabilities enabled on Portal's normal embedded tabs.
+        popup_settings = popup.settings()
+        popup_settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
+        popup_settings.setAttribute(QWebEngineSettings.WebAttribute.LocalStorageEnabled, True)
+        popup_settings.setAttribute(QWebEngineSettings.WebAttribute.WebGLEnabled, True)
+        popup_settings.setAttribute(QWebEngineSettings.WebAttribute.ScrollAnimatorEnabled, True)
+        popup_settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptCanAccessClipboard, True)
+        popup_settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptCanPaste, True)
+
+        # Keep a Python reference alive until the OAuth popup closes.
+        self._popup_windows.append(popup)
+
+        def forget_popup(*_):
+            try:
+                self._popup_windows.remove(popup)
+            except ValueError:
+                pass
+
+        popup.destroyed.connect(forget_popup)
+        popup.page().windowCloseRequested.connect(popup.close)
+
+        popup.show()
+        popup.raise_()
+        popup.activateWindow()
+        return popup
 
 
 class GlobalHotkeyBridge(QObject):
@@ -38,10 +97,8 @@ class AddLLMDialog(QDialog):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowFlags(
-            Qt.FramelessWindowHint |
-            Qt.Tool
-        )
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool)
+        self.setAttribute(Qt.WA_MacAlwaysShowToolWindow, True)
         self.setFixedSize(200, 250)
         self.setStyleSheet("""
             QDialog {
@@ -84,7 +141,7 @@ class AddLLMDialog(QDialog):
         self.search_bar.setPlaceholderText("Search LLMs...")
         self.search_bar.textChanged.connect(self.filter_list)
         layout.addWidget(self.search_bar)
-        self.add_llm_dialog = None
+
         self.list_widget = QListWidget()
         self.list_widget.itemClicked.connect(self.on_item_clicked)
         layout.addWidget(self.list_widget)
@@ -122,17 +179,11 @@ class ChatPanel(QWidget):
         super().__init__()
 
         self.extra_profiles = {}
+        self.add_llm_dialog = None
 
         self.bubble = bubble
         self.drag_position = None
         self.tab_animations = []
-
-        self.multitask_active = False
-        self.multitask_view = None
-        self.multitask_browsers = {}
-        self.multitask_senders = {} 
-        self.multitask_tab_button = None
-        self.multitask_prompt_overlay = None
 
         self.resize_margin = 8
         self.resize_direction = None
@@ -157,17 +208,33 @@ class ChatPanel(QWidget):
         )
 
         self.setting_panel.color_changed.connect(self.update_content_area_color)
-        self.setting_panel.clear_data_requested.connect(self.clear_browsing_data)
+        self.setting_panel.clear_current_data_requested.connect(
+            self.clear_current_browsing_data
+        )
+        self.setting_panel.clear_all_data_requested.connect(
+            self.clear_all_browsing_data
+        )
 
         self.hotkey_manager = HotkeyManager(self)
         self._mac_permission_prompted = False
 
         self.setting_panel.keybinds_updated.connect(self.apply_keybinds)
         self.apply_keybinds(self.setting_panel.current_keybinds)
-        self.add_llm_dialog = None
 
         self.create_layout()
         self.apply_real_minimum_size()
+
+    def track_animation(self, animation):
+        """Keep an animation alive only until its final frame has run."""
+        self.tab_animations.append(animation)
+        animation.finished.connect(lambda anim=animation: self.release_animation(anim))
+
+    def release_animation(self, animation):
+        try:
+            self.tab_animations.remove(animation)
+        except ValueError:
+            return
+        animation.deleteLater()
 
     def apply_real_minimum_size(self):
         """
@@ -203,6 +270,7 @@ class ChatPanel(QWidget):
         for action_id, data in keybinds_dict.items():
             key_str = data["key"]
             is_global = data["is_global"]
+
             if not key_str:
                 continue
 
@@ -212,7 +280,8 @@ class ChatPanel(QWidget):
                     permission_blocked = True
                     continue
                 ok = self.hotkey_manager.register(
-                    key_str, lambda a=action_id: self.hotkey_bridge.trigger.emit(a)
+                    key_str,
+                    lambda a=action_id: self.hotkey_bridge.trigger.emit(a),
                 )
                 if not ok:
                     print(f"Failed to bind global hotkey for {action_id}: {key_str}")
@@ -221,7 +290,7 @@ class ChatPanel(QWidget):
                 sc.activated.connect(lambda a=action_id: self.execute_hotkey_action(a))
                 self.local_shortcuts.append(sc)
 
-            self.hotkey_manager.commit()
+        self.hotkey_manager.commit()
 
         if permission_blocked:
             self.prompt_for_mac_accessibility_permission()
@@ -231,10 +300,6 @@ class ChatPanel(QWidget):
             return
         self._mac_permission_prompted = True
         self.hotkey_manager.request_permission()
-        # NOTE: after granting, macOS requires the app to be relaunched before
-        # the permission takes effect — it won't apply to the already-running
-        # process. Worth a small in-app banner here telling the user that;
-        # I left it as a TODO rather than guessing at your UI style.
 
     def execute_hotkey_action(self, action_id):
         if action_id == "summon":
@@ -274,7 +339,9 @@ class ChatPanel(QWidget):
 
             if panel_was_visible:
                 self.show()
-                WindowLevelController.set_pinned(self, not is_pinned)   # <-- here
+                WindowLevelController.set_pinned(self, not is_pinned)
+                if is_pinned:
+                    self.lower()
 
             if self.bubble:
                 bubble_was_visible = self.bubble.isVisible()
@@ -285,19 +352,22 @@ class ChatPanel(QWidget):
 
                 if bubble_was_visible:
                     self.bubble.show()
-                    WindowLevelController.set_pinned(self.bubble, not is_pinned)   # <-- and here
+                    WindowLevelController.set_pinned(self.bubble, not is_pinned)
+                    if is_pinned:
+                        self.bubble.lower()
 
     def cycle_next_llm(self):
-        if not self.active_llms: return
+        ordered_llms = self.ordered_provider_tabs()
+        if not ordered_llms: return
         current_idx = -1
-        for i, llm in enumerate(self.active_llms):
+        for i, llm in enumerate(ordered_llms):
             if llm["id"] == self.current_provider_id:
                 current_idx = i
                 break
-        if current_idx == -1 and self.active_llms: current_idx = 0
+        if current_idx == -1: current_idx = 0
 
-        next_idx = (current_idx + 1) % len(self.active_llms)
-        next_llm = self.active_llms[next_idx]
+        next_idx = (current_idx + 1) % len(ordered_llms)
+        next_llm = ordered_llms[next_idx]
 
         self.current_provider = next_llm["name"]
         self.current_provider_id = next_llm["id"]
@@ -332,6 +402,33 @@ class ChatPanel(QWidget):
                 {"id": str(uuid.uuid4()), "name": "Claude", "url": "https://claude.ai"},
                 {"id": str(uuid.uuid4()), "name": "Gemini", "url": "https://gemini.google.com"}
             ]
+            # The generated IDs are referenced by the saved current tab and
+            # tab order, so they must survive the first restart.
+            self.save_setting("active_llms", json.dumps(self.active_llms))
+
+        active_ids = [llm["id"] for llm in self.active_llms]
+        if self.current_provider_id not in active_ids:
+            if self.active_llms:
+                first_llm = self.active_llms[0]
+                self.current_provider = first_llm["name"]
+                self.current_provider_id = first_llm["id"]
+            else:
+                self.current_provider_id = None
+            self.save_setting("current_provider", self.current_provider)
+            self.save_setting("current_provider_id", self.current_provider_id)
+
+        saved_tab_order = self.settings.value("provider_tab_order")
+        try:
+            requested_order = json.loads(saved_tab_order) if saved_tab_order else []
+        except (TypeError, json.JSONDecodeError):
+            requested_order = []
+
+        self.provider_tab_order = [
+            llm_id for llm_id in requested_order if llm_id in active_ids
+        ]
+        self.provider_tab_order.extend(
+            llm_id for llm_id in active_ids if llm_id not in self.provider_tab_order
+        )
 
         saved_size = self.settings.value("window_size")
         if saved_size:
@@ -340,9 +437,9 @@ class ChatPanel(QWidget):
             self.resize(900, 700)
 
         self.setWindowFlags(
-            Qt.Tool |
             Qt.FramelessWindowHint |
-            Qt.WindowStaysOnTopHint
+            Qt.WindowStaysOnTopHint |
+            Qt.Tool
         )
 
         self.setAttribute(Qt.WA_TranslucentBackground)
@@ -413,20 +510,6 @@ class ChatPanel(QWidget):
                 background-color: #333333;
             }
 
-            QPushButton#multitaskButton {
-                background-color: rgba(99, 102, 241, 0.15);
-                border: 1px solid rgba(129, 140, 248, 0.45);
-                color: #ececec;
-                border-radius: 10px;
-                padding: 6px 12px;
-                font-size: 13px;
-                font-weight: 600;
-            }
-
-            QPushButton#multitaskButton:hover {
-                background-color: rgba(99, 102, 241, 0.26);
-                border: 1px solid rgba(165, 180, 252, 0.65);
-            }
         """)
 
     def create_widgets(self):
@@ -455,6 +538,14 @@ class ChatPanel(QWidget):
         self.llm_layout.setContentsMargins(0, 0, 0, 0)
         self.llm_layout.setSpacing(10)
 
+        self.tab_reorder_controller = TabReorderController(
+            self.llm_container,
+            self.llm_layout,
+            self,
+        )
+        self.tab_reorder_controller.order_changed.connect(self.apply_provider_tab_order)
+        self.tab_reorder_controller.order_committed.connect(self.save_provider_tab_order)
+
         self.add_button = QPushButton("+")
         self.add_button.setObjectName("addButton")
         self.add_button.setFixedSize(26, 26)
@@ -473,11 +564,6 @@ class ChatPanel(QWidget):
         self.settings_button.setFixedSize(32, 32)
         self.settings_button.clicked.connect(self.open_settings)
 
-        self.multitask_button = QPushButton("Multitask")
-        self.multitask_button.setObjectName("multitaskButton")
-        self.multitask_button.setFixedHeight(32)
-        self.multitask_button.clicked.connect(self.open_multitask_prompt)
-
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         icon_path = get_asset_path(os.path.join("assets", "gearsettingsgrey.png"))
 
@@ -490,25 +576,16 @@ class ChatPanel(QWidget):
         self.browser_stack.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.browsers = {}
 
-        self.profile = QWebEngineProfile("llm_profile", self.browser_stack)
-
         app_data_dir = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation)
-
         storage_path = os.path.join(app_data_dir, "Portal", "session_data")
-
-        os.makedirs(storage_path, exist_ok=True)
-
-        self.profile.setPersistentStoragePath(storage_path)
-        self.profile.setPersistentCookiesPolicy(QWebEngineProfile.ForcePersistentCookies)
-
-        # Hardening: Set a proper Accept-Language header. A missing or default
-        # Accept-Language header is a common bot detection signal.
-        self.profile.setHttpAcceptLanguage("en-US,en;q=0.9")
-
-        self.profile.downloadRequested.connect(self.handle_download_requested)
+        self.profile = self.create_browser_profile("llm_profile", storage_path)
 
         for llm in self.active_llms:
-            self.add_browser_to_stack(llm["id"], llm["url"])
+            self.add_browser_to_stack(
+                llm["id"],
+                llm["url"],
+                load_immediately=llm["id"] == self.current_provider_id,
+            )
 
         if self.current_provider_id and self.current_provider_id in self.browsers:
             self.browser_stack.setCurrentWidget(self.browsers[self.current_provider_id])
@@ -527,10 +604,28 @@ class ChatPanel(QWidget):
 
         download.setDownloadDirectory(os.path.dirname(path))
         download.setDownloadFileName(os.path.basename(path))
-        download.accept()        
+        download.accept()
 
-    def add_browser_to_stack(self, llm_id, url):
-        browser = QWebEngineView()
+    def create_browser_profile(self, profile_name, storage_path):
+        """Create a persistent profile with Portal's shared browser behavior."""
+        os.makedirs(storage_path, exist_ok=True)
+
+        profile = QWebEngineProfile(profile_name, self.browser_stack)
+        profile.setPersistentStoragePath(storage_path)
+        profile.setCachePath(os.path.join(storage_path, "cache"))
+        profile.setPersistentCookiesPolicy(QWebEngineProfile.ForcePersistentCookies)
+
+        # Hardening: Set a proper Accept-Language header. A missing or default
+        # Accept-Language header is a common bot detection signal.
+        profile.setHttpAcceptLanguage("en-US,en;q=0.9")
+
+        # Downloads belong to their profile. Connecting this here guarantees
+        # that shared and isolated LLM tabs all open the same Save File dialog.
+        profile.downloadRequested.connect(self.handle_download_requested)
+        return profile
+
+    def add_browser_to_stack(self, llm_id, url, load_immediately=False):
+        browser = PortalWebEngineView()
 
         browser_policy = browser.sizePolicy()
         browser_policy.setHorizontalPolicy(QSizePolicy.Expanding)
@@ -553,6 +648,28 @@ class ChatPanel(QWidget):
         idx = self._find_llm_index(llm_id)
         llm_entry = self.active_llms[idx] if idx != -1 else {}
         profile = self.get_profile_for_entry(llm_entry)
+        self.set_browser_profile(browser, profile)
+
+        browser.setProperty("portal_url", url)
+        browser.setProperty("portal_loaded", False)
+        if load_immediately:
+            self.ensure_browser_loaded(browser, url)
+
+        self.browsers[llm_id] = browser
+        self.browser_stack.addWidget(browser)
+
+    @staticmethod
+    def ensure_browser_loaded(browser, url=None):
+        """Load a normal provider tab once, when the user first selects it."""
+        if browser.property("portal_loaded"):
+            return
+        target_url = url or browser.property("portal_url")
+        if target_url:
+            browser.setProperty("portal_loaded", True)
+            browser.setUrl(QUrl(target_url))
+
+    def set_browser_profile(self, browser, profile):
+        """Give a browser a page backed by the requested session profile."""
         page = QWebEnginePage(profile, browser)
 
         def grant_feature_permission(origin, feature):
@@ -562,10 +679,6 @@ class ChatPanel(QWidget):
 
         page.featurePermissionRequested.connect(grant_feature_permission)
         browser.setPage(page)
-        browser.setUrl(QUrl(url))
-
-        self.browsers[llm_id] = browser
-        self.browser_stack.addWidget(browser)
 
     def get_profile_for_entry(self, llm_entry):
         profile_id = (llm_entry or {}).get("profile_id")
@@ -573,22 +686,59 @@ class ChatPanel(QWidget):
             return self.profile
 
         if profile_id not in self.extra_profiles:
-            app_data_dir = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation)
-            storage_path = os.path.join(app_data_dir, "Portal", "session_data_isolated", profile_id)
-            os.makedirs(storage_path, exist_ok=True)
+            storage_path = self.isolated_profile_storage_path(profile_id)
 
-            profile = QWebEngineProfile(f"llm_isolated_{profile_id}", self.browser_stack)
-            profile.setPersistentStoragePath(storage_path)
-            profile.setPersistentCookiesPolicy(QWebEngineProfile.ForcePersistentCookies)
-            profile.setHttpAcceptLanguage("en-US,en;q=0.9")
+            profile = self.create_browser_profile(f"llm_isolated_{profile_id}", storage_path)
             self.extra_profiles[profile_id] = profile
 
         return self.extra_profiles[profile_id]
+
+    @staticmethod
+    def isolated_profile_storage_path(profile_id):
+        """Return a path guaranteed to stay inside Portal's isolated-data root."""
+        app_data_dir = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation)
+        root = os.path.abspath(os.path.join(app_data_dir, "Portal", "session_data_isolated"))
+        storage_path = os.path.abspath(os.path.join(root, str(profile_id)))
+        if os.path.normcase(os.path.commonpath((root, storage_path))) != os.path.normcase(root):
+            raise ValueError("Invalid isolated browser profile ID")
+        return storage_path
+
+    @staticmethod
+    def remove_profile_storage(storage_path):
+        """Remove a released WebEngine profile without blocking Portal's UI."""
+        def remove_with_retries():
+            for attempt in range(6):
+                try:
+                    shutil.rmtree(storage_path)
+                    return
+                except FileNotFoundError:
+                    return
+                except OSError as error:
+                    if attempt == 5:
+                        print(f"Failed to remove browser profile data at {storage_path}: {error}")
+                        return
+                    time.sleep(0.25 * (attempt + 1))
+
+        threading.Thread(target=remove_with_retries, daemon=True).start()
+
+    def release_unused_profile(self, profile_id):
+        """Destroy and erase an isolated profile after its final tab is deleted."""
+        if not profile_id or any(llm.get("profile_id") == profile_id for llm in self.active_llms):
+            return
+        profile = self.extra_profiles.pop(profile_id, None)
+        if profile is None:
+            return
+        storage_path = self.isolated_profile_storage_path(profile_id)
+        profile.destroyed.connect(
+            lambda *_args, path=storage_path: self.remove_profile_storage(path)
+        )
+        profile.deleteLater()
 
     def current_browser(self):
         return self.browser_stack.currentWidget()
 
     def render_active_llms(self):
+        self.tab_reorder_controller.reset()
         self.llm_buttons = {}
 
         for i in reversed(range(self.llm_layout.count())):
@@ -603,12 +753,16 @@ class ChatPanel(QWidget):
         if self.llm_layout.indexOf(self.add_button) == -1:
             self.llm_layout.addWidget(self.add_button, alignment=Qt.AlignVCenter)
 
-        for i, llm in enumerate(self.active_llms):
-            btn = QPushButton(llm["name"])
+        ordered_llms = self.ordered_provider_tabs()
+        for i, llm in enumerate(ordered_llms):
+            btn = ReorderableTabButton(llm["name"], llm["id"])
             btn.clicked.connect(
                 lambda checked=False, name=llm["name"], url=llm["url"], llm_id=llm["id"]:
                 self.open_llm_url(name, url, llm_id)
             )
+            btn.drag_started.connect(self.tab_reorder_controller.begin_drag)
+            btn.drag_moved.connect(self.tab_reorder_controller.move_drag)
+            btn.drag_finished.connect(self.tab_reorder_controller.finish_drag)
 
             btn.setContextMenuPolicy(Qt.CustomContextMenu)
             btn.customContextMenuRequested.connect(
@@ -620,33 +774,58 @@ class ChatPanel(QWidget):
 
             self.llm_layout.insertWidget(i, btn, alignment=Qt.AlignVCenter)
 
-        if self.multitask_active:
-            self.multitask_tab_button = QPushButton("Multitask")
-            self.multitask_tab_button.setStyleSheet("""
-                QPushButton {
-                    background-color: rgba(99, 102, 241, 0.20);
-                    color: #ffffff;
-                    border: 1px solid rgba(129, 140, 248, 0.65);
-                    border-radius: 10px;
-                    padding: 8px 14px;
-                    font-size: 14px;
-                    font-weight: 600;
-                }
-                QPushButton:hover {
-                    background-color: rgba(99, 102, 241, 0.32);
-                }
-            """)
-            self.multitask_tab_button.clicked.connect(self.show_multitask_tab)
-            self.multitask_tab_button.setContextMenuPolicy(Qt.CustomContextMenu)
-            self.multitask_tab_button.customContextMenuRequested.connect(
-                lambda pos, button=self.multitask_tab_button: self.show_multitask_context_menu(button)
-            )
-            self.llm_layout.insertWidget(len(self.active_llms), self.multitask_tab_button, alignment=Qt.AlignVCenter)
-
         self.llm_layout.addStretch()
 
         self.add_button.setEnabled(True)
         self.add_button.show()
+        self.tab_reorder_controller.set_tabs(
+            self.llm_buttons,
+            [llm["id"] for llm in ordered_llms],
+        )
+
+    def ordered_provider_tabs(self):
+        llms_by_id = {llm["id"]: llm for llm in self.active_llms}
+        ordered = [
+            llms_by_id[llm_id]
+            for llm_id in self.provider_tab_order
+            if llm_id in llms_by_id
+        ]
+        ordered_ids = {llm["id"] for llm in ordered}
+        ordered.extend(llm for llm in self.active_llms if llm["id"] not in ordered_ids)
+        return ordered
+
+    def apply_provider_tab_order(self, ordered_ids):
+        active_ids = {llm["id"] for llm in self.active_llms}
+        self.provider_tab_order = [
+            llm_id for llm_id in ordered_ids if llm_id in active_ids
+        ]
+        self.provider_tab_order.extend(
+            llm["id"] for llm in self.active_llms
+            if llm["id"] not in self.provider_tab_order
+        )
+
+    def save_provider_tab_order(self, ordered_ids):
+        self.apply_provider_tab_order(ordered_ids)
+        self.save_setting("provider_tab_order", json.dumps(self.provider_tab_order))
+
+    def add_to_provider_tab_order(self, llm_id, after_id=None):
+        current_order = [llm["id"] for llm in self.ordered_provider_tabs()]
+        if llm_id in current_order:
+            current_order.remove(llm_id)
+
+        if after_id in current_order:
+            current_order.insert(current_order.index(after_id) + 1, llm_id)
+        else:
+            current_order.append(llm_id)
+
+        self.provider_tab_order = current_order
+        self.save_setting("provider_tab_order", json.dumps(self.provider_tab_order))
+
+    def remove_from_provider_tab_order(self, llm_id):
+        self.provider_tab_order = [
+            tab_id for tab_id in self.provider_tab_order if tab_id != llm_id
+        ]
+        self.save_setting("provider_tab_order", json.dumps(self.provider_tab_order))
 
     def show_llm_context_menu(self, button, llm_id):
         menu = QMenu(self)
@@ -729,6 +908,7 @@ class ChatPanel(QWidget):
             "profile_id": original.get("profile_id"),  # None = shared main profile, or same isolated id
         }
         self.active_llms.insert(index + 1, copy_entry)
+        self.add_to_provider_tab_order(copy_entry["id"], after_id=llm_id)
 
         self.add_browser_to_stack(copy_entry["id"], copy_entry["url"])
 
@@ -760,12 +940,17 @@ class ChatPanel(QWidget):
             return
 
         deleting_current = llm_id == self.current_provider_id
-        del self.active_llms[index]
+        deleted_entry = self.active_llms.pop(index)
+        self.remove_from_provider_tab_order(llm_id)
 
         if llm_id in self.browsers:
             browser_to_delete = self.browsers.pop(llm_id)
             self.browser_stack.removeWidget(browser_to_delete)
+            for popup in list(browser_to_delete._popup_windows):
+                popup.close()
             browser_to_delete.deleteLater()
+
+        self.release_unused_profile(deleted_entry.get("profile_id"))
 
         if deleting_current:
             if self.active_llms:
@@ -773,7 +958,9 @@ class ChatPanel(QWidget):
                 self.current_provider = fallback["name"]
                 self.current_provider_id = fallback["id"]
                 if fallback["id"] in self.browsers:
-                    self.browser_stack.setCurrentWidget(self.browsers[fallback["id"]])
+                    fallback_browser = self.browsers[fallback["id"]]
+                    self.browser_stack.setCurrentWidget(fallback_browser)
+                    self.ensure_browser_loaded(fallback_browser, fallback["url"])
             else:
                 self.current_provider = "ChatGPT"
                 self.current_provider_id = None
@@ -990,10 +1177,10 @@ class ChatPanel(QWidget):
         shrink_group.finished.connect(start_slide_after_pause)
         collapse_group.finished.connect(finish_delete)
 
-        self.tab_animations.append(pop_anim)
-        self.tab_animations.append(shrink_group)
-        self.tab_animations.append(particle_group)
-        self.tab_animations.append(collapse_group)
+        self.track_animation(pop_anim)
+        self.track_animation(shrink_group)
+        self.track_animation(particle_group)
+        self.track_animation(collapse_group)
 
         pop_anim.start()
 
@@ -1005,25 +1192,17 @@ class ChatPanel(QWidget):
 
         dialog = AddLLMDialog(self)
         self.add_llm_dialog = dialog
-
         dialog.llm_selected.connect(self.add_llm_to_bar)
 
-        button_pos = self.add_button.mapToGlobal(
-            QPoint(0, self.add_button.height())
-        )
+        button_pos = self.add_button.mapToGlobal(QPoint(0, self.add_button.height()))
+        dialog.move(button_pos.x() - (dialog.width() // 2), button_pos.y() + 5)
 
-        dialog.move(
-            button_pos.x() - (dialog.width() // 2),
-            button_pos.y() + 5
-        )
-
-        def clear_dialog_reference():
+        def clear_dialog_reference(*_):
             if self.add_llm_dialog is dialog:
                 self.add_llm_dialog = None
 
         dialog.finished.connect(clear_dialog_reference)
         dialog.destroyed.connect(clear_dialog_reference)
-
         dialog.show()
         dialog.raise_()
         dialog.activateWindow()
@@ -1079,6 +1258,7 @@ class ChatPanel(QWidget):
         def after_drop():
             drop.hide()  # <--- HIDE INSTEAD OF DELETE
             self.active_llms.append(new_llm)
+            self.add_to_provider_tab_order(new_llm["id"])
             self.save_setting("active_llms", json.dumps(self.active_llms))
             self.render_active_llms()
 
@@ -1086,7 +1266,7 @@ class ChatPanel(QWidget):
             QTimer.singleShot(0, lambda: self.play_plus_to_tab_animation(old_plus_rect, new_llm["id"]))
 
         drop_group.finished.connect(after_drop)
-        self.tab_animations.append(drop_group)
+        self.track_animation(drop_group)
         drop_group.start()
 
     def play_water_splash(self, old_plus_rect, plus_center, new_llm):
@@ -1155,6 +1335,7 @@ class ChatPanel(QWidget):
 
         def start_tab_materialize():
             self.active_llms.append(new_llm)
+            self.add_to_provider_tab_order(new_llm["id"])
             self.save_setting("active_llms", json.dumps(self.active_llms))
             self.render_active_llms()
 
@@ -1166,7 +1347,7 @@ class ChatPanel(QWidget):
                 widget.hide()  # <--- HIDE INSTEAD OF DELETE
 
         splash_group.finished.connect(cleanup_splash)
-        self.tab_animations.append(splash_group)
+        self.track_animation(splash_group)
         splash_group.start()
 
     def play_plus_to_tab_animation(self, old_plus_rect, new_llm_id):
@@ -1217,319 +1398,8 @@ class ChatPanel(QWidget):
             self.add_button.setEnabled(True)
 
         group.finished.connect(finish)
-        self.tab_animations.append(group)
+        self.track_animation(group)
         group.start()
-
-    def open_multitask_prompt(self):
-        if self.multitask_prompt_overlay:
-            self.multitask_prompt_overlay.deleteLater()
-            self.multitask_prompt_overlay = None
-            return
-
-        button_rect = self.widget_rect_in_panel(self.multitask_button)
-        start_rect = QRect(
-            button_rect.center().x() - 20,
-            button_rect.center().y() - 16,
-            40,
-            32
-        )
-
-        target_w = min(650, max(500, self.width() - 100))
-        target_h = 155
-
-        target_rect = QRect(
-            (self.width() - target_w) // 2,
-            72,
-            target_w,
-            target_h
-        )
-
-        overlay = QFrame(self)
-        overlay.setObjectName("multitaskPromptOverlay")
-        overlay.setGeometry(start_rect)
-        overlay.setStyleSheet("""
-            QFrame#multitaskPromptOverlay {
-                background-color: rgba(24, 24, 28, 245);
-                border: 2px solid rgba(129, 140, 248, 180);
-                border-radius: 18px;
-            }
-            QLabel {
-                background: transparent;
-                color: #ffffff;
-                font-size: 15px;
-                font-weight: 600;
-            }
-            QLineEdit {
-                background-color: #151515;
-                border: 1px solid #333333;
-                border-radius: 10px;
-                color: white;
-                padding: 9px 12px;
-                font-size: 14px;
-                font-family: "Segoe UI";
-            }
-        """)
-
-        overlay_layout = QVBoxLayout(overlay)
-        overlay_layout.setContentsMargins(18, 14, 18, 14)
-        overlay_layout.setSpacing(10)
-
-        title = QLabel("Ask every AI")
-
-        warning = QLabel(
-            "PS: Make sure you're logged in to each AI. "
-            "Providers that aren't signed in may not receive your prompt."
-        )
-
-        warning.setWordWrap(True)
-
-        warning.setStyleSheet("""
-            QLabel {
-                color: #b4b4b4;
-                font-size: 11px;
-                background: transparent;
-            }
-        """)
-        input_box = QLineEdit()
-        input_box.setPlaceholderText("Type your question and press Enter...")
-
-        overlay_layout.addWidget(title)
-        overlay_layout.addWidget(warning)
-        overlay_layout.addWidget(input_box)
-
-        overlay.show()
-        overlay.raise_()
-        self.multitask_prompt_overlay = overlay
-
-        grow = QPropertyAnimation(overlay, b"geometry")
-        grow.setDuration(260)
-        grow.setStartValue(start_rect)
-        grow.setEndValue(target_rect)
-        grow.setEasingCurve(QEasingCurve.OutCubic)
-
-        fade = QGraphicsOpacityEffect(overlay)
-        overlay.setGraphicsEffect(fade)
-        fade_anim = QPropertyAnimation(fade, b"opacity")
-        fade_anim.setDuration(220)
-        fade_anim.setStartValue(0.0)
-        fade_anim.setEndValue(1.0)
-        fade_anim.setEasingCurve(QEasingCurve.OutCubic)
-
-        group = QParallelAnimationGroup(self)
-        group.addAnimation(grow)
-        group.addAnimation(fade_anim)
-
-        def focus_input():
-            input_box.setFocus()
-
-        group.finished.connect(focus_input)
-        self.tab_animations.append(group)
-        group.start()
-
-        input_box.returnPressed.connect(lambda: self.submit_multitask_prompt(input_box.text().strip(), overlay))
-
-    def submit_multitask_prompt(self, prompt, overlay):
-        if not prompt:
-            return
-
-        start_rect = overlay.geometry()
-        end_rect = QRect(start_rect.center().x(), start_rect.center().y(), 0, 0)
-
-        shrink = QPropertyAnimation(overlay, b"geometry")
-        shrink.setDuration(180)
-        shrink.setStartValue(start_rect)
-        shrink.setEndValue(end_rect)
-        shrink.setEasingCurve(QEasingCurve.InCubic)
-
-        effect = overlay.graphicsEffect()
-        fade = QPropertyAnimation(effect, b"opacity")
-        fade.setDuration(160)
-        fade.setStartValue(1.0)
-        fade.setEndValue(0.0)
-
-        group = QParallelAnimationGroup(self)
-        group.addAnimation(shrink)
-        group.addAnimation(fade)
-
-        def finish():
-            overlay.deleteLater()
-            self.multitask_prompt_overlay = None
-            self.open_multitask_tab(prompt)
-
-        group.finished.connect(finish)
-        self.tab_animations.append(group)
-        group.start()
-
-    def open_multitask_tab(self, prompt):
-        if self.multitask_active and self.multitask_view:
-            self.show_multitask_tab()
-            self.send_prompt_to_existing_multitask(prompt)
-            return
-
-        self.multitask_active = True
-        self.build_multitask_view(prompt)
-        self.render_active_llms()
-        self.show_multitask_tab()
-
-    def send_prompt_to_existing_multitask(self, prompt):
-        if not self.multitask_browsers:
-            return
-
-        for llm in self.active_llms:
-            browser = self.multitask_browsers.get(llm["id"])
-            if browser:
-                self.try_send_prompt_to_browser(browser, prompt)
-
-    def show_multitask_tab(self):
-        if self.multitask_view:
-            self.content_stack.setCurrentWidget(self.multitask_view)
-
-    def show_multitask_context_menu(self, button):
-        menu = QMenu(self)
-        menu.setStyleSheet("""
-            QMenu { background-color: #1f1f1f; border: 1px solid #333333; border-radius: 8px; padding: 4px; color: #ececec; }
-            QMenu::item { padding: 6px 16px; border-radius: 4px; }
-            QMenu::item:selected { background-color: #333333; }
-        """)
-        delete_action = menu.addAction("Delete Multitask")
-        chosen = menu.exec(button.mapToGlobal(button.rect().bottomLeft()))
-        if chosen == delete_action:
-            self.delete_multitask_tab()
-
-    def delete_multitask_tab(self):
-        self.multitask_active = False
-
-        if self.multitask_view:
-            if self.content_stack.currentWidget() is self.multitask_view:
-                self.content_stack.setCurrentWidget(self.browser_stack)
-            self.content_stack.removeWidget(self.multitask_view)
-            self.multitask_view.deleteLater()
-            self.multitask_view = None
-
-        for browser in self.multitask_browsers.values():
-            browser.deleteLater()
-        self.multitask_browsers.clear()
-        self.multitask_senders.clear()
-        self.multitask_tab_button = None
-        self.render_active_llms()
-
-    def build_multitask_view(self, prompt):
-        if self.multitask_view:
-            self.content_stack.removeWidget(self.multitask_view)
-            self.multitask_view.deleteLater()
-            self.multitask_view = None
-            self.multitask_browsers.clear()
-
-        wrapper = QWidget()
-        wrapper.setStyleSheet("""
-            QWidget { background-color: transparent; }
-            QLabel#multitaskTitle { color: #ffffff; font-size: 18px; font-weight: 700; }
-            QLabel#multitaskQuestion { color: #b4b4b4; font-size: 13px; }
-            QLabel#multitaskProvider { color: #ececec; font-size: 13px; font-weight: 600; padding: 3px 0px; }
-            QFrame#multitaskCard { background-color: rgba(20, 20, 20, 150); border: 1px solid rgba(255, 255, 255, 20); border-radius: 14px; }
-        """)
-
-        outer = QVBoxLayout(wrapper)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(10)
-
-        title = QLabel("Multitask")
-        title.setObjectName("multitaskTitle")
-        question = QLabel(prompt)
-        question.setObjectName("multitaskQuestion")
-        question.setWordWrap(True)
-        outer.addWidget(title)
-        outer.addWidget(question)
-
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
-
-        row_holder = QWidget()
-        row = QHBoxLayout(row_holder)
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(12)
-
-        for llm in self.active_llms:
-            card = QFrame()
-            card.setObjectName("multitaskCard")
-            card_layout = QVBoxLayout(card)
-            card_layout.setContentsMargins(10, 10, 10, 10)
-            card_layout.setSpacing(8)
-
-            label = QLabel(llm["name"])
-            label.setObjectName("multitaskProvider")
-            card_layout.addWidget(label)
-
-            status = QLabel("Loading...")
-            status.setStyleSheet("QLabel { color: #a5b4fc; font-size: 12px; background: transparent; }")
-            card_layout.addWidget(status)
-
-            browser = QWebEngineView()
-            browser.setMinimumWidth(360)
-            browser.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-
-            settings = browser.settings()
-            settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
-            settings.setAttribute(QWebEngineSettings.WebAttribute.LocalStorageEnabled, True)
-            settings.setAttribute(QWebEngineSettings.WebAttribute.WebGLEnabled, True)
-            settings.setAttribute(QWebEngineSettings.WebAttribute.ScrollAnimatorEnabled, True)
-            settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptCanAccessClipboard, True)
-            settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptCanPaste, True)
-
-            page = QWebEnginePage(self.profile, browser)
-
-            def grant_feature_permission(origin, feature, p=page):
-                p.setFeaturePermission(origin, feature, QWebEnginePage.PermissionPolicy.PermissionGrantedByUser)
-
-            page.featurePermissionRequested.connect(grant_feature_permission)
-            browser.setPage(page)
-
-            browser.setProperty("multitask_sent", False)
-            browser.setProperty("multitask_started", False)
-            browser.setProperty("multitask_provider", llm["name"])
-            browser.setProperty("multitask_id", llm["id"])
-
-            self.multitask_browsers[llm["id"]] = browser
-            card_layout.addWidget(browser, 1)
-            row.addWidget(card)
-
-            def handle_loaded(ok, b=browser, q=prompt, st=status, provider=llm["name"]):
-                if not ok:
-                    st.setText("Page failed to load")
-                    st.setStyleSheet("QLabel { color: #fca5a5; font-size: 12px; background: transparent; }")
-                    return
-                if b.property("multitask_started"):
-                    return
-                b.setProperty("multitask_started", True)
-                sender = MultitaskSender(b, provider_name=provider, status_label=st, parent=self)
-                self.multitask_senders[b.property("multitask_id")] = sender
-                QTimer.singleShot(3500, lambda s=sender, qq=q: s.send(qq))
-
-            browser.loadFinished.connect(handle_loaded)
-            browser.setUrl(QUrl(llm["url"]))
-
-        row.addStretch()
-        scroll.setWidget(row_holder)
-        outer.addWidget(scroll, 1)
-
-        self.multitask_view = wrapper
-        self.content_stack.addWidget(wrapper)
-
-    def send_prompt_to_existing_multitask(self, prompt):
-        if not self.multitask_browsers:
-            return
-        for llm in self.active_llms:
-            browser = self.multitask_browsers.get(llm["id"])
-            if browser:
-                browser.setProperty("multitask_sent", False)
-                sender = self.multitask_senders.get(llm["id"])
-                if sender is None:
-                    sender = MultitaskSender(browser, provider_name=llm["name"], parent=self)
-                    self.multitask_senders[llm["id"]] = sender
-                sender.send(prompt)
 
     def create_layout(self):
         top_bar = QHBoxLayout()
@@ -1539,7 +1409,6 @@ class ChatPanel(QWidget):
         top_bar.setContentsMargins(18, 4, 18, 4)
         top_bar.addWidget(self.scroll_area, alignment=Qt.AlignVCenter)
         top_bar.addStretch()
-        top_bar.addWidget(self.multitask_button, alignment=Qt.AlignVCenter)
         top_bar.addWidget(self.settings_button, alignment=Qt.AlignVCenter)
         top_bar.addWidget(self.close_button, alignment=Qt.AlignVCenter)
 
@@ -1599,7 +1468,9 @@ class ChatPanel(QWidget):
     def open_llm_url(self, name, url, llm_id=None):
         self.show_browser()
         if llm_id and llm_id in self.browsers:
-            self.browser_stack.setCurrentWidget(self.browsers[llm_id])
+            browser = self.browsers[llm_id]
+            self.browser_stack.setCurrentWidget(browser)
+            self.ensure_browser_loaded(browser, url)
 
             self.current_provider = name
             self.current_provider_id = llm_id
@@ -1618,22 +1489,119 @@ class ChatPanel(QWidget):
             f"QFrame#mainContainer {{ background-color: {new_color}; border: 1px solid rgba(255, 255, 255, 20); border-radius: 24px; }}")
         self.save_setting("resize_color", new_color)
 
-    def clear_browsing_data(self):
-        self.profile.cookieStore().deleteAllCookies()
-        self.profile.clearHttpCache()
-
-        js_clear = "window.localStorage.clear(); window.sessionStorage.clear();"
-
-        for browser in self.browsers.values():
-            browser.page().runJavaScript(js_clear, lambda res, b=browser: b.reload())
-
-        if hasattr(self, "multitask_browsers"):
-            for browser in self.multitask_browsers.values():
-                browser.page().runJavaScript(js_clear, lambda res, b=browser: b.reload())
-
+    def return_to_browser_after_clearing_data(self):
         self.show_browser()
         self.setting_panel.appearance_btn.setChecked(True)
         self.setting_panel.content_stack.setCurrentIndex(0)
+
+    def clear_profile_browsing_data(self, profile, browsers):
+        """Clear one profile, then reload its tabs after Qt finishes."""
+        browsers = list(browsers)
+        clear_storage = "window.localStorage.clear(); window.sessionStorage.clear();"
+        pending_storage_callbacks = len(browsers)
+        cleanup_started = False
+
+        def start_profile_cleanup():
+            nonlocal cleanup_started
+            if cleanup_started:
+                return
+            cleanup_started = True
+            reload_scheduled = False
+
+            def schedule_reload():
+                nonlocal reload_scheduled
+                if reload_scheduled:
+                    return
+                reload_scheduled = True
+                try:
+                    profile.clearHttpCacheCompleted.disconnect(schedule_reload)
+                except (RuntimeError, TypeError):
+                    pass
+
+                # Cookie deletion is asynchronous too. The short delay after
+                # cache completion lets both WebEngine cleanup requests settle.
+                def reload_browsers():
+                    for browser in browsers:
+                        try:
+                            # Provider tabs explicitly use False until first
+                            # opened; only reload the ones already loaded.
+                            if browser.property("portal_loaded") is not False:
+                                browser.reload()
+                        except RuntimeError:
+                            # The tab may have been closed during cleanup.
+                            pass
+
+                QTimer.singleShot(250, reload_browsers)
+
+            profile.clearHttpCacheCompleted.connect(schedule_reload)
+            profile.cookieStore().deleteAllCookies()
+            profile.clearHttpCache()
+
+            # Keep automatic reloading reliable even if WebEngine does not
+            # emit its cache-completed signal for an already-empty cache.
+            QTimer.singleShot(2000, schedule_reload)
+
+        def storage_cleared(_result=None):
+            nonlocal pending_storage_callbacks
+            pending_storage_callbacks -= 1
+            if pending_storage_callbacks <= 0:
+                start_profile_cleanup()
+
+        if browsers:
+            for browser in browsers:
+                browser.page().runJavaScript(clear_storage, storage_cleared)
+
+            # A stalled provider page must not prevent cookies from clearing.
+            QTimer.singleShot(1000, start_profile_cleanup)
+        else:
+            start_profile_cleanup()
+
+    def clear_current_browsing_data(self):
+        browser = self.current_browser()
+        index = self._find_llm_index(self.current_provider_id)
+        if browser is None or index == -1:
+            return
+
+        entry = self.active_llms[index]
+        profile_id = entry.get("profile_id")
+        profile_users = sum(
+            1 for llm in self.active_llms
+            if llm.get("profile_id") == profile_id
+        )
+
+        if profile_id and profile_users == 1:
+            # This profile belongs only to the selected tab, so it is safe to
+            # remove the whole session without affecting any other provider.
+            profile = browser.page().profile()
+            self.clear_profile_browsing_data(profile, [browser])
+        else:
+            # Legacy tabs and duplicated tabs can share a profile. Move only
+            # the selected tab to a brand-new profile so the others stay
+            # signed in while this tab starts with a clean session.
+            new_profile_id = str(uuid.uuid4())
+            entry["profile_id"] = new_profile_id
+            self.save_setting("active_llms", json.dumps(self.active_llms))
+
+            new_profile = self.get_profile_for_entry(entry)
+            self.set_browser_profile(browser, new_profile)
+            browser.setUrl(QUrl(entry["url"]))
+
+        self.return_to_browser_after_clearing_data()
+
+    def clear_all_browsing_data(self):
+        browsers = list(self.browsers.values())
+        browsers_by_profile = {
+            profile: []
+            for profile in [self.profile, *self.extra_profiles.values()]
+        }
+        for browser in browsers:
+            profile = browser.page().profile()
+            browsers_by_profile.setdefault(profile, []).append(browser)
+
+        for profile, profile_browsers in browsers_by_profile.items():
+            self.clear_profile_browsing_data(profile, profile_browsers)
+
+        self.return_to_browser_after_clearing_data()
 
     def hideEvent(self, event):
         self.save_setting("window_size", self.size())
@@ -1699,8 +1667,6 @@ class ChatPanel(QWidget):
             self.resize_hidden_widget = self.browser_stack
         elif current is self.setting_panel:
             self.resize_hidden_widget = self.setting_panel
-        elif getattr(self, "multitask_view", None) is not None and current is self.multitask_view:
-            self.resize_hidden_widget = self.multitask_view
 
         if self.resize_hidden_widget:
             self.resize_hidden_widget.hide()

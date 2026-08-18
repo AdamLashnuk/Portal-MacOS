@@ -1,4 +1,5 @@
 import sys
+from ctypes import c_void_p
 
 try:
     import objc

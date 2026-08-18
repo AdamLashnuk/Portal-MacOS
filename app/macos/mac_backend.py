@@ -8,17 +8,15 @@ from app.hotkeys.backend_base import HotkeyBackend
 
 try:
     from pynput import keyboard as pynput_keyboard
-    print(f"[DEBUG] pynput imported OK. Listener class = {pynput_keyboard.Listener}")
 except ImportError as e:
     pynput_keyboard = None
-    print(f"[DEBUG] pynput import FAILED: {e}")
+    print(f"pynput import failed: {e}")
 
 try:
     import Quartz
-    print("[DEBUG] Quartz imported OK")
 except ImportError as e:
     Quartz = None
-    print(f"[DEBUG] Quartz import FAILED: {e}")
+    print(f"Quartz import failed: {e}")
 
 try:
     from AppKit import NSEvent
@@ -56,9 +54,7 @@ def _to_pynput_combo(key_str):
             tokens.append(f"<{lower}>")
         else:
             return None
-    combo = "+".join(tokens) if tokens else None
-    print(f"[DEBUG] _to_pynput_combo({key_str!r}) -> {combo!r}")
-    return combo
+    return "+".join(tokens) if tokens else None
 
 
 def _build_unmodified_key_map():
@@ -170,7 +166,6 @@ if pynput_keyboard is not None:
                         event, Quartz.kCGKeyboardEventKeycode
                     )
                     if keycode == _CAPS_LOCK_KEYCODE:
-                        print("[DEBUG] Caps Lock flagsChanged -> skipping")
                         return
 
                 if Quartz is not None and event_type == Quartz.NSSystemDefined:
@@ -182,7 +177,6 @@ if pynput_keyboard is not None:
                     # way to bind media/system keys as hotkeys anyway (they're
                     # not in _KEY_ALIASES), so skipping this event type
                     # entirely costs no real functionality.
-                    print("[DEBUG] NSSystemDefined event -> skipping")
                     return
             except Exception as e:
                 print(f"[event filter] error inspecting event: {e}")
@@ -204,21 +198,17 @@ class MacHotkeyBackend(HotkeyBackend):
 
         if pynput_keyboard is not None:
             listener_cls = _SafeMacListener if Quartz is not None else pynput_keyboard.Listener
-            print(f"[DEBUG] Using listener class: {listener_cls}")
             try:
                 self._listener = listener_cls(
                     on_press=self._on_press,
                     on_release=self._on_release,
                 )
                 self._listener.start()
-                print("[DEBUG] Listener constructed and started successfully")
             except Exception as e:
-                print(f"[DEBUG] Listener construction/start FAILED: {e}")
+                print(f"macOS hotkey listener failed to start: {e}")
 
     def _on_press(self, key):
-        print(f"[DEBUG] on_press: {key}")
         if key == pynput_keyboard.Key.caps_lock:
-            print("[DEBUG] on_press caught caps_lock, ignoring")
             return
         with self._lock:
             hotkeys = list(self._hotkeys.values())
@@ -230,12 +220,10 @@ class MacHotkeyBackend(HotkeyBackend):
             try:
                 hk.press(canonical_key, modifier_flags)
             except Exception as e:
-                print(f"[DEBUG] hk.press error: {e}")
+                print(f"macOS hotkey press handler failed: {e}")
 
     def _on_release(self, key):
-        print(f"[DEBUG] on_release: {key}")
         if key == pynput_keyboard.Key.caps_lock:
-            print("[DEBUG] on_release caught caps_lock, ignoring")
             return
         with self._lock:
             hotkeys = list(self._hotkeys.values())
@@ -246,18 +234,15 @@ class MacHotkeyBackend(HotkeyBackend):
             try:
                 hk.release(canonical_key)
             except Exception as e:
-                print(f"[DEBUG] hk.release error: {e}")
+                print(f"macOS hotkey release handler failed: {e}")
 
     def permission_status(self):
         if Quartz is None:
-            print("[DEBUG] permission_status: Quartz is None -> 'unsupported'")
             return "unsupported"
         try:
-            status = "granted" if Quartz.CGPreflightListenEventAccess() else "denied"
-            print(f"[DEBUG] permission_status: {status}")
-            return status
+            return "granted" if Quartz.CGPreflightListenEventAccess() else "denied"
         except Exception as e:
-            print(f"[DEBUG] permission_status error: {e} -> 'unsupported'")
+            print(f"Could not check macOS hotkey permission: {e}")
             return "unsupported"
 
     def request_permission(self):
@@ -289,5 +274,4 @@ class MacHotkeyBackend(HotkeyBackend):
 
         with self._lock:
             self._hotkeys[combo] = hotkey
-        print(f"[DEBUG] register: combo={combo} registered successfully")
         return True
