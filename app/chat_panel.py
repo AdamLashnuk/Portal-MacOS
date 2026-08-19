@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (QFileDialog, QWidget, QPushButton, QVBoxLayout, Q
 from PySide6.QtCore import Qt, QUrl, QSize, QTimer, QSettings, QPropertyAnimation, QEasingCurve, Signal, QPoint, QRect, \
     QStandardPaths, \
     QParallelAnimationGroup, QSequentialAnimationGroup, QObject
-from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor, QCursor, QShortcut, QKeySequence
+from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor, QCursor, QShortcut, QKeySequence, QPen
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEngineProfile, QWebEnginePage, QWebEngineSettings
 
@@ -22,6 +22,46 @@ from app.hotkeys.key_sequences import canonical_to_qt
 from app.macos.window_level import WindowLevelController
 from app.tab_reorder import ReorderableTabButton, TabReorderController
 from app.utils import get_asset_path
+
+
+def create_line_icon(shape, color, active_color=None, size=12, stroke_width=2):
+    icon = QIcon()
+    colors = (
+        (QIcon.Mode.Normal, QColor(color)),
+        (QIcon.Mode.Active, QColor(active_color or color)),
+    )
+
+    for mode, line_color in colors:
+        pixmap = QPixmap(size * 2, size * 2)
+        pixmap.setDevicePixelRatio(2)
+        pixmap.fill(Qt.transparent)
+
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(QPen(
+            line_color,
+            stroke_width,
+            Qt.SolidLine,
+            Qt.RoundCap,
+            Qt.RoundJoin,
+        ))
+
+        inset = 2
+        far_edge = size - inset
+        center = size // 2
+        if shape == "plus":
+            painter.drawLine(QPoint(inset, center), QPoint(far_edge, center))
+            painter.drawLine(QPoint(center, inset), QPoint(center, far_edge))
+        elif shape == "close":
+            painter.drawLine(QPoint(inset, inset), QPoint(far_edge, far_edge))
+            painter.drawLine(QPoint(far_edge, inset), QPoint(inset, far_edge))
+        else:
+            raise ValueError(f"Unsupported line icon shape: {shape}")
+
+        painter.end()
+        icon.addPixmap(pixmap, mode)
+
+    return icon
 
 
 class PortalWebEngineView(QWebEngineView):
@@ -99,6 +139,7 @@ class AddLLMDialog(QDialog):
         super().__init__(parent)
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool)
         self.setAttribute(Qt.WA_MacAlwaysShowToolWindow, True)
+        self.setAttribute(Qt.WA_DeleteOnClose, True)
         self.setFixedSize(200, 250)
         self.setStyleSheet("""
             QDialog {
@@ -132,6 +173,27 @@ class AddLLMDialog(QDialog):
             QListWidget::item:selected {
                 background-color: #444444;
             }
+            QScrollBar:vertical {
+                background: transparent;
+                width: 6px;
+                margin: 2px 0px;
+            }
+            QScrollBar::handle:vertical {
+                background-color: #555555;
+                border-radius: 3px;
+                min-height: 24px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background-color: #777777;
+            }
+            QScrollBar::add-line:vertical,
+            QScrollBar::sub-line:vertical {
+                height: 0px;
+            }
+            QScrollBar::add-page:vertical,
+            QScrollBar::sub-page:vertical {
+                background: transparent;
+            }
         """)
 
         layout = QVBoxLayout(self)
@@ -143,6 +205,7 @@ class AddLLMDialog(QDialog):
         layout.addWidget(self.search_bar)
 
         self.list_widget = QListWidget()
+        self.list_widget.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.list_widget.itemClicked.connect(self.on_item_clicked)
         layout.addWidget(self.list_widget)
 
@@ -480,24 +543,17 @@ class ChatPanel(QWidget):
             QPushButton#closeButton {
                 background-color: transparent;
                 border: none;
-                color: #b4b4b4;
-                font-size: 16px; 
-                font-weight: 100;
                 padding: 0px; 
                 margin: 0px;
             }
 
             QPushButton#closeButton:hover {
-                color: white;
                 background-color: #333333;
                 border-radius: 8px;
             }
 
             QPushButton#addButton {
-                font-size: 20px;
-                font-weight: bold;
                 padding: 0px;
-                padding-bottom: 6px; 
             }
 
             QPushButton#settingsButton {
@@ -546,17 +602,21 @@ class ChatPanel(QWidget):
         self.tab_reorder_controller.order_changed.connect(self.apply_provider_tab_order)
         self.tab_reorder_controller.order_committed.connect(self.save_provider_tab_order)
 
-        self.add_button = QPushButton("+")
+        self.add_button = QPushButton()
         self.add_button.setObjectName("addButton")
         self.add_button.setFixedSize(26, 26)
+        self.add_button.setIcon(create_line_icon("plus", "#ececec"))
+        self.add_button.setIconSize(QSize(12, 12))
         self.add_button.clicked.connect(self.open_add_llm_menu)
 
         self.scroll_area.setWidget(self.llm_container)
         self.render_active_llms()
 
-        self.close_button = QPushButton("✕")
+        self.close_button = QPushButton()
         self.close_button.setObjectName("closeButton")
         self.close_button.setFixedSize(32, 32)
+        self.close_button.setIcon(create_line_icon("close", "#b4b4b4", "#ffffff"))
+        self.close_button.setIconSize(QSize(12, 12))
         self.close_button.clicked.connect(self.close_panel)
 
         self.settings_button = QPushButton()
@@ -1030,8 +1090,10 @@ class ChatPanel(QWidget):
         self.pool_tab_clone = QPushButton(self)
         self.pool_tab_clone.hide()
 
-        self.pool_plus_clone = QPushButton("+", self)
+        self.pool_plus_clone = QPushButton(self)
         self.pool_plus_clone.setObjectName("addButton")
+        self.pool_plus_clone.setIcon(create_line_icon("plus", "#ececec"))
+        self.pool_plus_clone.setIconSize(QSize(12, 12))
         self.pool_plus_clone.hide()
 
     def play_delete_pop_animation(self, llm_id):
@@ -1186,8 +1248,7 @@ class ChatPanel(QWidget):
 
     def open_add_llm_menu(self):
         if self.add_llm_dialog is not None:
-            self.add_llm_dialog.close()
-            self.add_llm_dialog = None
+            self.close_add_llm_dialog()
             return
 
         dialog = AddLLMDialog(self)
@@ -1207,6 +1268,22 @@ class ChatPanel(QWidget):
         dialog.raise_()
         dialog.activateWindow()
         dialog.search_bar.setFocus()
+
+    def close_add_llm_dialog(self):
+        dialog = self.add_llm_dialog
+        if dialog is None:
+            return
+
+        self.add_llm_dialog = None
+        dialog.close()
+
+    def moveEvent(self, event):
+        self.close_add_llm_dialog()
+        super().moveEvent(event)
+
+    def resizeEvent(self, event):
+        self.close_add_llm_dialog()
+        super().resizeEvent(event)
 
     def add_llm_to_bar(self, name, url):
         unique_name = self._unique_llm_name(name)
