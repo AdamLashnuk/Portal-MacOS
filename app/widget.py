@@ -1,6 +1,6 @@
 import os
 from PySide6.QtWidgets import QWidget, QSystemTrayIcon, QMenu, QApplication
-from PySide6.QtCore import Qt, QPoint, QRect, QSettings
+from PySide6.QtCore import Qt, QPoint, QRect, QSettings, QTimer
 from PySide6.QtGui import QGuiApplication, QPainter, QColor, QPixmap, QPen, QAction, QIcon, QCursor
 from app.animation_window import AnimationWindow
 from app.chat_panel import ChatPanel
@@ -15,6 +15,8 @@ class FloatingWidget(QWidget):
         self.chat_panel = ChatPanel(self)
         self.drag_position = QPoint()
         self.was_dragging = False
+        self.startup_widget_position = None
+        self.startup_position_mode = None
         self.animation_window = AnimationWindow()
         self.animation_window.open_finished.connect(self.show_chat_panel_after_animation)
         self.animation_window.close_finished.connect(self.show_bubble_after_animation)
@@ -22,42 +24,44 @@ class FloatingWidget(QWidget):
         self.setup_window()
         self.setup_tray_icon()
         self.set_initial_position()
+        QTimer.singleShot(100, self.capture_startup_position)
 
     def set_initial_position(self):
         settings = QSettings("MyLLMWidget", "ChatPanel")
-
         saved_position = settings.value(
             "widget_startup_position",
             "center"
         )
+        self.startup_position_mode = saved_position
         screen = QGuiApplication.primaryScreen().availableGeometry()
+        self.move(self.position_for_startup_mode(saved_position, screen))
+
+    def capture_startup_position(self):
+        self.startup_widget_position = QPoint(self.pos())
+
+    def position_for_startup_mode(self, mode, screen):
         app_width = self.width()
         app_height = self.height()
-        margin = 20
-        y_offset = margin + 30  # Pushes it away from the corners
-        
-        # FIX: Match the exact lowercase keys saved by setting_panel.py
-        if saved_position == "top_right":
-            x = screen.width() - app_width  
-            y = y_offset                    
-        elif saved_position == "top_left":
-            x = 0                           
-            y = y_offset                    
-        elif saved_position == "bottom_right":
-            x = screen.width() - app_width  
-            y = screen.height() - app_height - y_offset 
-        elif saved_position == "bottom_left":
-            x = 0                           
-            y = screen.height() - app_height - y_offset 
-        elif saved_position == "center":
-            x = (screen.width() - app_width) // 2
-            y = (screen.height() - app_height) // 2
+        y_offset = 50  # Pushes it away from the corners
+        origin_y = screen.top() if screen.top() < 0 else 0
+
+        if mode == "top_right":
+            x = screen.right() - app_width + 1
+            y = origin_y + y_offset
+        elif mode == "top_left":
+            x = screen.left()
+            y = origin_y + y_offset
+        elif mode == "bottom_right":
+            x = screen.right() - app_width + 1
+            y = origin_y + screen.height() - app_height - y_offset
+        elif mode == "bottom_left":
+            x = screen.left()
+            y = origin_y + screen.height() - app_height - y_offset
         else:
-            # Fallback (Center)
-            x = (screen.width() - app_width) // 2
-            y = (screen.height() - app_height) // 2
-            
-        self.move(x, y)
+            x = screen.left() + (screen.width() - app_width) // 2
+            y = screen.top() + (screen.height() - app_height) // 2
+
+        return QPoint(x, y)
 
     def setup_window(self):
         self.setFixedSize(90, 90)
@@ -114,8 +118,8 @@ class FloatingWidget(QWidget):
         settings_action.triggered.connect(self.open_settings_directly)
         self.tray_menu.addAction(settings_action)
 
-        reset_position_action = QAction("Reset Window Position", self)
-        reset_position_action.triggered.connect(self.reset_window_position)
+        reset_position_action = QAction("Reset Widget Position", self)
+        reset_position_action.triggered.connect(self.reset_widget_position)
         self.tray_menu.addAction(reset_position_action)
 
         self.tray_menu.addSeparator()
@@ -136,12 +140,24 @@ class FloatingWidget(QWidget):
             self.show()
             self.raise_()
 
-    def reset_window_position(self):
+    def reset_widget_position(self):
+        settings = QSettings("MyLLMWidget", "ChatPanel")
+        startup_position = settings.value(
+            "widget_startup_position",
+            "center"
+        )
         screen = self.target_screen_geometry()
 
-        bubble_x = screen.center().x() - (self.width() // 2)
-        bubble_y = screen.center().y() - (self.height() // 2)
-        self.move(bubble_x, bubble_y)
+        if (
+            self.startup_widget_position is not None
+            and startup_position == self.startup_position_mode
+        ):
+            target_position = self.startup_widget_position
+        else:
+            target_position = self.position_for_startup_mode(startup_position, screen)
+
+        if self.pos() != target_position:
+            self.move(target_position)
 
         panel_x, panel_y = self.calculate_chat_position()
         panel_x = max(screen.left(), min(panel_x, screen.left() + screen.width() - self.chat_panel.width()))
