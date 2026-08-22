@@ -1,0 +1,116 @@
+name: Release macOS
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release tag (for example, v0.1.1)
+        required: true
+        default: v0.1.1
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/release-macos.yml
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: macos-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+
+      - name: Create macOS icon
+        run: |
+          mkdir -p build/Portal.iconset
+          sips -z 16 16 assets/portalbig.png --out build/Portal.iconset/icon_16x16.png
+          sips -z 32 32 assets/portalbig.png --out build/Portal.iconset/icon_16x16@2x.png
+          sips -z 32 32 assets/portalbig.png --out build/Portal.iconset/icon_32x32.png
+          sips -z 64 64 assets/portalbig.png --out build/Portal.iconset/icon_32x32@2x.png
+          sips -z 128 128 assets/portalbig.png --out build/Portal.iconset/icon_128x128.png
+          sips -z 256 256 assets/portalbig.png --out build/Portal.iconset/icon_128x128@2x.png
+          sips -z 256 256 assets/portalbig.png --out build/Portal.iconset/icon_256x256.png
+          sips -z 512 512 assets/portalbig.png --out build/Portal.iconset/icon_256x256@2x.png
+          sips -z 512 512 assets/portalbig.png --out build/Portal.iconset/icon_512x512.png
+          sips -z 1024 1024 assets/portalbig.png --out build/Portal.iconset/icon_512x512@2x.png
+          iconutil -c icns build/Portal.iconset -o build/Portal.icns
+
+      - name: Build Portal.app
+        run: |
+          pyinstaller \
+            --noconfirm \
+            --clean \
+            --windowed \
+            --name Portal \
+            --icon build/Portal.icns \
+            --osx-bundle-identifier com.portal.app \
+            --add-data "assets:assets" \
+            main.py
+          codesign --force --deep --sign - dist/Portal.app
+
+      - name: Create DMG
+        run: |
+          mkdir -p build/dmg
+          cp -R dist/Portal.app build/dmg/Portal.app
+          ln -s /Applications build/dmg/Applications
+          hdiutil create \
+            -volname Portal \
+            -srcfolder build/dmg \
+            -ov \
+            -format UDZO \
+            dist/Portal-macOS-Apple-Silicon.dmg
+          shasum -a 256 dist/Portal-macOS-Apple-Silicon.dmg > dist/Portal-macOS-Apple-Silicon.dmg.sha256
+
+      - name: Choose release tag
+        id: release
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            tag="$REQUESTED_VERSION"
+          else
+            tag="v0.1.0"
+          fi
+
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]]; then
+            echo "Invalid release tag: $tag" >&2
+            exit 1
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" \
+              dist/Portal-macOS-Apple-Silicon.dmg \
+              dist/Portal-macOS-Apple-Silicon.dmg.sha256 \
+              --clobber
+          else
+            gh release create "$RELEASE_TAG" \
+              dist/Portal-macOS-Apple-Silicon.dmg \
+              dist/Portal-macOS-Apple-Silicon.dmg.sha256 \
+              --target "$GITHUB_SHA" \
+              --title "Portal $RELEASE_TAG" \
+              --notes "First downloadable pre-release of Portal for Apple-silicon Macs. Download the DMG, drag Portal to Applications, then open Portal." \
+              --prerelease
+          fi
