@@ -12,6 +12,7 @@ on:
       - main
     paths:
       - .github/workflows/release-macos.yml
+      - requirements.txt
 
 permissions:
   contents: write

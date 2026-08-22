@@ -1,5 +1,4 @@
 PySide6
-PySide6-WebEngine
 pynput
 pyobjc-framework-Quartz; sys_platform == "darwin"
 pyobjc-framework-Cocoa
